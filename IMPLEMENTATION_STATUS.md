@@ -72,13 +72,14 @@ sets a session flag that offset-dependent readers consult.
 - `papyrus/ModProbe` — plugin / script / DLL probes, resolved once.
 - `papyrus/SaveMigrationApi` + `SaveMigrationDebug.psc` — 7 debug natives.
 
-### Categories (31 registered — the plan's full set)
+### Categories (32 registered — the plan's full set, plus cleared locations)
 `system.load_order`, `npc.roster`, `player.identity`, `player.skills`,
 `player.level`, `player.perks`, `player.beast_form`, `player.spells_shouts`,
 `player.attributes`, `player.currency`, `player.inventory`, `player.equipment`,
-`player.map_markers`, `player.location`, `npc.wait_state`, `npc.relationship`,
-`npc.inventory`, `npc.equipment`, `npc.life_state`, `npc.follower_regroup`,
-`player.attributes_reassert`, `player.game_clock`.
+`player.map_markers`, `world.cleared_locations`, `player.location`,
+`npc.wait_state`, `npc.relationship`, `npc.inventory`, `npc.equipment`,
+`npc.life_state`, `npc.follower_regroup`, `player.attributes_reassert`,
+`player.game_clock`.
 
 Shared implementations: `categories/InventoryCommon` (collect, chunked apply,
 crafted-gear reconstruction) and `categories/EquipmentCommon` (32 biped slots + both
@@ -96,6 +97,10 @@ hands), used by both the player and every NPC.
   `AddObjectToContainer` needs no 3D and `EquipObject` silently no-ops without it.
 - Map marker flags are re-asserted on **every** `kPostLoadGame`, making `.ess`
   persistence of `ExtraMapMarker` irrelevant to correctness.
+- Cleared locations carry **both** `BGSLocation::cleared` and `everCleared` —
+  restoring only the former passes the map icon and fails every radiant-quest
+  condition that reads the latter. Restore only ever *sets*: a target save that
+  cleared something the snapshot had not is never walked backwards.
 - Player position refuses to move into an unresolvable cell.
 - `bKillToMatch` needs a second acknowledgement key and hard-skips essential,
   protected and quest-aliased actors.
@@ -209,13 +214,65 @@ independently of this project — it was losing user data.
 
 ---
 
-## Verification not yet performed
+## Verification — what has and has not been run
 
-Nothing in the plan's **Verification** section has been run: no snapshot round-trip, no
-prompt-gating test, no in-game restore. The code compiles and deploys; it has not been
-exercised against a running game.
+### Verified in game (2026-08-07, MGON, Skyrim VR 1.4.15)
 
-Start with the plan's fastest signal — set `bSnapshot=1`, load an existing save, and
-check that `snapshots/<saveId>__<name>/manifest.json` appears. Then quickload three
-times and confirm no second snapshot is written, which exercises the anti-thrash key.
-`cgf "SaveMigrationDebug.StatusReport"` prints every gate the lifecycle consults.
+Everything up to and including the main menu:
+
+- `SaveMigration.dll` loads: `sksevr.log` reports
+  `loaded correctly (handle 119)`, and `SaveMigration.log` is written.
+- `sqlite3` links **statically** — `dumpbin /dependents` lists only system DLLs.
+  This is what the `x64-windows-skse.cmake` triplet fix was for; before it the
+  plugin imported a loose `sqlite3.dll` and SKSE failed the load with error 126.
+- Config reads `bSnapshot=1` and the plugin reports `mode=SNAPSHOT`.
+- The three co-save records (`SMID` / `SMST` / `SMPW`) register.
+- `ModProbe` resolves `DressUpVR`, `SkyrimNet`, `OBody`, `TheNewGentleman`,
+  `PapyrusUtil`.
+- `WellKnownForms`: **all vanilla forms resolved**.
+- `VRLayoutProbe`: **layout trusted** — `currentMapMarkers` consistent.
+- All registered categories freeze into the ordered list with the intended phase
+  numbers, `world.cleared_locations` included.
+- No crash: no `crash-*.log` for the session, process healthy through the whole
+  boot.
+
+### Not verified: anything that needs a loaded save
+
+**Blocked on hardware, not on the code.** With no headset connected the modlist
+runs on `ocu-headless-layer`'s fake OpenXR session. The game boots and renders
+fine, but Skyrim VR's main menu takes no keyboard input in that state — measured
+across four independent paths, all delivered successfully and all ignored:
+
+| Path | Result |
+|---|---|
+| `SendInput` scan codes (Enter, E, Space, Down), game window foregrounded and confirmed owned by `SkyrimVR.exe` | no effect |
+| `SendInput` virtual keys (`VK_RETURN`) | no effect |
+| `PostMessage` `WM_KEYDOWN`/`WM_CHAR`/`WM_KEYUP` straight to the window | no effect |
+| Screenshot key (`DIK_SYSRQ`), used as an input oracle | no `ScreenShot*.bmp` written — the game consumed nothing |
+
+That matches `skse/ocu-headless-layer/STATUS.md`, which lists **the controller
+path** as an untested remaining item. The menu is controller-driven; with the
+layer supplying static poses and no buttons, nothing can select "Continue".
+
+So the remaining verification needs the Quest 3 on. With it connected:
+
+1. Load an existing save and check
+   `snapshots/<saveId>__<name>/manifest.json` appears, alongside
+   `player/world.cleared_locations.json`.
+2. Quickload three times and confirm no second snapshot is written — that is the
+   anti-thrash key.
+3. `cgf "SaveMigrationDebug.StatusReport"` prints every gate the lifecycle
+   consults.
+
+### Launch notes worth keeping
+
+- **MO2 must not be started by Task Scheduler.** An MO2 launched directly by a
+  scheduled task fails every hooked spawn with
+  `Error 5 ERROR_ACCESS_DENIED` — for `sksevr_loader.exe` *and* for a plain
+  `.bat`, while the same binary spawns fine from the same token via a direct
+  `CreateProcessW`. Start MO2 through `explorer.exe` instead
+  (`explorer.exe "…\ModOrganizer.exe"`); the shortcut can then be forwarded to it
+  by any means.
+- The game window exists and is findable, but only via `EnumWindows` matching
+  class `Skyrim VR`. `FindWindowW("Skyrim VR", …)` returns 0 and
+  `Process.MainWindowHandle` is 0.

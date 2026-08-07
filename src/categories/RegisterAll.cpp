@@ -29,6 +29,7 @@
 #include "categories/npc/NpcWaitState.h"
 #include "categories/system/LoadOrderCategory.h"
 #include "categories/system/SkyrimNetSideCarCategory.h"
+#include "categories/world/ClearedLocations.h"
 #include "core/CategoryRegistry.h"
 
 namespace SaveMigration::Categories {
@@ -113,8 +114,12 @@ void RegisterAllCategories() {
     registry.AddGlobal(std::make_unique<PlayerEquipment>());
 
     // ── Phase kWorldState ─────────────────────────────────────────────────
-    // Before the teleport, so the map is coherent on arrival.
+    // Before the teleport, so the map is coherent on arrival. Cleared locations
+    // follow the markers rather than precede them: both are pure flag writes with
+    // no dependency between them, and this way a location the player can now
+    // travel to already reads as cleared by the time they can go there.
     registry.AddGlobal(std::make_unique<PlayerMapMarkers>());
+    registry.AddGlobal(std::make_unique<ClearedLocations>());
 
     // ── Phase kTeleport ───────────────────────────────────────────────────
     // Equip while stationary in the start cell; a mid-teleport equip desyncs the
