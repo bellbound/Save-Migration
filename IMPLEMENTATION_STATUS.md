@@ -1,0 +1,221 @@
+# Save-Migration — implementation status
+
+Built against the plan in `im-starting-a-new-eventual-comet.md`. This file records
+exactly what is implemented and what is not, so nothing has to be inferred from the
+source tree.
+
+**Build:** `pwsh -ExecutionPolicy Bypass -File build-skse-mods.ps1 -Mod Save-Migration`
+(from the workspace root). Close Skyrim first — the DLL is locked while it runs.
+
+> **Build environment note.** Ninja spawns one `cl.exe` per core, and each reserves
+> virtual memory for the large `RE/Skyrim.h` PCH. On a machine with less than ~10 GB
+> of commit headroom this fails with `C3859: Failed to create virtual memory for PCH`.
+> Cap it: `$env:CMAKE_BUILD_PARALLEL_LEVEL = "4"` before invoking the build script.
+>
+> Also: `build-skse-mods.ps1` prints "All 1 mods built successfully" even when ninja
+> failed. That is a pre-existing bug in the shared script, not in this project. Read
+> the raw build output rather than the summary line.
+
+---
+
+## The four VR corrections — all honoured, all verified against the installed headers
+
+Verified against `skse/VR-Sex-Menu/build/vcpkg_installed/x64-windows-skse/include/RE/`,
+which is authoritative over the vendored copy in `skse/SkyrimNet/external/`.
+
+| # | Correction | Where |
+|---|---|---|
+| 1 | `GetInfoRuntimeData()` resolves to VR offset **0** (unsupported); skills must come from `GetVRInfoRuntimeData()` at `0xFE0`. Wrapped once. | `core/VRLayoutProbe.h` → `PlayerSkillsOf()` / `PlayerSkillDataOf()` |
+| 2 | `ResolveToRuntimeFormID` branched on `TESFile::IsLight()`, which is wrong on VR (no ESL space). All resolution now goes through `TESDataHandler::LookupForm`. | `model/FormKeyUtil.cpp`, `model/FormRef.h` |
+| 3 | `addedPerks` / `perks` / `standingStonePerks` are annotated as *guesses* in the header. Never read. Perks come from `GetFormArray<BGSPerk>()` × `HasPerk`. | `categories/player/PlayerPerks.cpp` |
+| 4 | `MoveTo_Impl` is private; re-declared against `Offset::TESObjectREFR::MoveTo` (`RELOCATION_ID(56227, 56626)`), the same address CommonLib's own public `SetPosition()` calls. | `util/MoveRefTo.h` |
+
+`ProbeVRLayout()` runs at `kDataLoaded`, sanity-checks the one field the header marks
+"confirmed" (`currentMapMarkers`), and on failure logs `E_RUNTIME_LAYOUT_SUSPECT` and
+sets a session flag that offset-dependent readers consult.
+
+---
+
+## Implemented and building
+
+### Framework
+- `core/SerializationHub` — the single SKSE serialization owner, fanning out to
+  `SMID` / `SMST` / `SMPW` with bounded length-prefixed strings.
+- `core/SaveIdentity` (`SMID`), `core/MigrationState` (`SMST`),
+  `defer/PendingWorkQueue` (`SMPW`, bounds `512` items / `8192` byte payloads).
+- `core/Category.h` — `Phase`, `RestoreMode`, `Requirement`, `CategoryDescriptor`,
+  `IGlobalCategory`, `IActorCategory`, `CollectContext`, `ApplyContext`.
+- `core/CategoryRegistry` — **one unified ordered list**, not separate global and
+  actor lists. See "Deviations" below.
+- `core/Worker` — one owned, joined worker thread.
+- `core/LifecycleController` — the full state machine, every gate, the 3-button
+  prompt with loading-screen re-arms.
+- `core/SnapshotOrchestrator` — single-`AddTask` harvest, anti-thrash state key.
+- `core/RestoreOrchestrator` — phase-chained apply, per-frame continuation.
+- `model/SnapshotDocument` — B1 invariant **enforced**, not just documented: a
+  `Members()` tuple plus a `static_assert` that every member is
+  `nlohmann::json` / `std::string` / arithmetic.
+- `store/*` — paths, staged-then-swapped writer with two generations, reader with
+  the schema gate, load-order fingerprint including old-runtime-ID → FormKey.
+- `report/*` — closed `ReasonCode` enum with a remediation hint per code, three
+  nesting levels, and a sink that **refuses** to put one item in two buckets.
+- `defer/*` — four sinks that only enqueue, frame-coalesced drain, full retirement
+  policy (`applied` / `retry` / `exhausted` / `expired` / `unresolvable`).
+- `papyrus/PapyrusInterface` — every fix from the plan: real string/bool getters
+  (the originals always returned `nullopt`), the `TESForm*` packing fix, no
+  `WaitForResult` anywhere, `CallMethod` via `DispatchMethodCall2`, `CallAliasMethod`
+  via the raw handle overload, `ModEvent` bridge, `PapyrusStepQueue`.
+- `papyrus/PapyrusVariableInterface` — writes (`SetVariable`, `SetArrayElement`,
+  `ReplaceArray`), alias scope, `EnumerateRefAliases`, `FindAliasIndexHolding`,
+  `FindQuestByScriptName`, `AssertPropertyType` gating every write, and the
+  `ConvertVariable` fix (`FormType::None` is not a valid `VMTypeID`).
+- `papyrus/ModProbe` — plugin / script / DLL probes, resolved once.
+- `papyrus/SaveMigrationApi` + `SaveMigrationDebug.psc` — 7 debug natives.
+
+### Categories (31 registered — the plan's full set)
+`system.load_order`, `npc.roster`, `player.identity`, `player.skills`,
+`player.level`, `player.perks`, `player.beast_form`, `player.spells_shouts`,
+`player.attributes`, `player.currency`, `player.inventory`, `player.equipment`,
+`player.map_markers`, `player.location`, `npc.wait_state`, `npc.relationship`,
+`npc.inventory`, `npc.equipment`, `npc.life_state`, `npc.follower_regroup`,
+`player.attributes_reassert`, `player.game_clock`.
+
+Shared implementations: `categories/InventoryCommon` (collect, chunked apply,
+crafted-gear reconstruction) and `categories/EquipmentCommon` (32 biped slots + both
+hands), used by both the player and every NPC.
+
+### Not-negotiable behaviours that are in place
+- Gold is a **delta**, never an inventory item — a repeated restore cannot double it.
+- Skills write **both** stores (`PlayerSkills::Data` and `avStorage`), with
+  `bVerifySkillMirror` reading them back and reporting `W_SKILL_MIRROR_ASYMMETRIC`.
+- `perkCount` is written verbatim, never derived.
+- Relationship rank handles the **inversion** (`papyrusRank = 4 - level`) and caps at
+  Ally unless `bAllowLoverRank=1`; falls back to VM dispatch plus read-back
+  verification when no record exists.
+- NPC inventory is **eager**, NPC equipment is **deferred** — because
+  `AddObjectToContainer` needs no 3D and `EquipObject` silently no-ops without it.
+- Map marker flags are re-asserted on **every** `kPostLoadGame`, making `.ess`
+  persistence of `ExtraMapMarker` irrelevant to correctness.
+- Player position refuses to move into an unresolvable cell.
+- `bKillToMatch` needs a second acknowledgement key and hard-skips essential,
+  protected and quest-aliased actors.
+- Reports go to `<Documents>/My Games/Skyrim VR/SKSE/SaveMigration/`, atomically, all
+  engine text through `ConvertSkyrimTextToUTF8` before `SafeDump`.
+
+---
+
+### Integrations (all eight, plan step 11)
+
+| Category | Phase | Load-bearing detail |
+|---|---|---|
+| `npc.fertility` | 42 | Get-or-create via `TrackedActorAdd`, `UpdateStorage()`, then the `len == TrackedActors.Length + 1` assertion; refuses to write a short array. `LastConception` written **last**. `_updatedToVersion` gate. `bFertilityDryRun` logs every intended write. |
+| `npc.obody_preset` | 42 | `obody_<signed decimal>_preset` — the signed cast is the whole trick. Distribution key preserved; `MarkForReprocess` never called; morphs not snapshotted. |
+| `npc.home_mhiyh` | 44 | `ForceAlias` dispatched one per frame, then **the alias index is read back** and *that* index's 7 markers are moved. `GetNumAliases() - 3`. `kLoadedOnly` aliases defer. Faction verified with `AddToFaction` fallback. |
+| `npc.home_nff` | 44 | Rank-encoded residency; markers first; `SetFollowerHome`; `nwsBaseTotal` written **last** because `AddFollowerHome` early-returns on it. |
+| `npc.outfit_vr_dressup` | 46 | Map injection instant → top-up → `EnsureOutfitItemsInInventory` → `ApplyOutfitNow` → `LockActor`. Availability requires interface **v2**, not just the DLL. |
+| `npc.outfit_dudestia` | 46 | Mirrors `FindEmpty` + `ForceRefTo`; **`EmptySlot` written first**; no `AddSubject`, no `ChangeState`, no `MakeNude`. |
+| `npc.tng` | 48 | Player only. Addon set by index then **verified by FormKey read-back with an index sweep**. INI never written directly. |
+| `npc.skyrimnet_accompany` | 90 | Projected from `HasPackage`/AV/linked ref; `RegisterPackage` + `EvaluatePackage` last. |
+
+### SkyrimNet side-car (plan step 12) — both phases
+
+- **R1** `store/SkyrimNetSideCar` — `VACUUM INTO` through a read-only handle,
+  embeddings dropped, prompt archive copied under the `iMaxSideCarMb` budget,
+  talked-to list resolved to FormKeys *while the source session is live*.
+  On restore: `uuid_mappings.form_id` repaired via
+  `OldRuntimeIdToFormKey`; unresolvable rows **deleted and logged**, never parked at
+  `form_id = 0` (the virtual-entity bucket); `bard_songs.save_id` re-stamped; orphans
+  reported without deletion in the four tables `UUIDDriftConsolidator` misses;
+  `PRAGMA journal_mode=DELETE` then `VACUUM`.
+- **R2** `store/SkyrimNetDbSwap` — backs up to `.db.premigration`, renames the
+  `.pending` into place at `kPreLoadGame`, clears the marker.
+- The extra save+reload is surfaced as `SKYRIMNET_RELOAD_REQUIRED` in the report *and*
+  as an in-game notification.
+
+### DressUpInterface002 (plan step 10) — in `skse/VR-Dress-Up`
+
+- `src/api/DressUpInterface002.{h,cpp}`, returned by the existing
+  `GetDressUpInterface` export for version 2. **v001 untouched** — its vtable is frozen.
+- `EnumerateOutfits`, `EnumerateOutfitItems`, `EnumeratePlayerGivenItems`,
+  `SetOutfitByFormKeys`, `MarkPlayerGivenByFormKeys`, `EnsureOutfitItemsInInventory`,
+  `ApplyOutfitNow`, plus v001's five methods so a consumer needs one interface.
+- `SavedOutfit::actorFormKey` added, co-save bumped to **v5**, v4 still readable. On
+  load the FormKey is preferred over SKSE's ref-ID resolution and a disagreement is
+  logged.
+- Strings cross the DLL boundary as a borrowed `StringList` of `const char*`, never
+  `std::string`/`std::vector`.
+
+---
+
+## A bug found in VR-Dress-Up while doing this
+
+`skse/VR-Dress-Up/src/dressup/FormKeyUtil.cpp` had **the same VR ESL bug** that
+correction 2 describes — the hand-rolled `0xFE000000 | (smallFileCompileIndex << 12)`
+synthesis, branching on `TESFile::IsLight()`.
+
+This was not cosmetic there. On VR the synthesised ID resolves to nothing, so
+`SavedArmorItem::GetArmor()` returned `nullptr`, `ApplyOutfit` classified the item as
+"no longer valid", and **it was then permanently removed from the stored outfit**. Every
+ESL-sourced armour piece was being silently deleted from saved outfits on VR.
+
+Fixed in place by routing through `TESDataHandler::LookupForm`. Worth knowing
+independently of this project — it was losing user data.
+
+---
+
+## Deviations from the plan, and why
+
+1. **One unified category list instead of separate global and actor lists.** The plan
+   implies globals and per-actor categories can be walked separately. They cannot: the
+   apply order requires the attribute re-assert (a global) to run *after* NPC equipment
+   (per-actor) in the same phase, and a globals-then-actors walk silently inverts that.
+   `CategoryRegistry::Ordered()` preserves registration order within a phase and both
+   orchestrators walk it.
+
+2. **`PlayerAttributes` is split into three registered categories** — `PlayerLevel`
+   (`kProgression`), `PlayerAttributes` (`kEconomy`) and `PlayerAttributesReassert`
+   (`kFollowers`) — all in `PlayerAttributes.{h,cpp}`. The plan's file list has one
+   entry, but its apply order requires perks and spells to land *between* the level
+   write and the health/magicka/stamina write, which one category cannot express.
+
+3. **`bRestoreQuestPerks` added to `[Restore]`.** The plan's prose requires
+   quest-granted perks to be "recorded but default OFF" but its INI block has no key
+   for it.
+
+4. **`WellKnownForms` resolves vanilla forms three ways** (INI override → editor ID →
+   documented FormID, type-checked). Only `CurrentFollowerFaction` (`0x0005C84E`) is
+   verified against decompiled sources in this workspace; the others are
+   documented-only and say so in the source. Each failure narrows one roster source and
+   emits one report line — it cannot corrupt a migration.
+
+5. **Four integration phases added between `kEconomy` (40) and `kInventory` (50).**
+   The plan's `Phase` enum puts `kIntegrations` at 90, but its apply order puts the
+   integrations at steps 6–10 — *before* map markers, inventory and equipment. The
+   apply order is the stated correctness argument, so the enum gained
+   `kIntegrationsState` (42), `kIntegrationsHomes` (44), `kIntegrationsOutfits` (46)
+   and `kIntegrationsAppearance` (48). `kIntegrations` (90) now carries only the
+   phase-2 behaviour changes, which is where SkyrimNet accompany belongs.
+
+6. **`ExtraDataUtil` only carries a *player-set* custom name.** The engine also parks
+   generated names (tempered prefixes) in `ExtraTextDisplayData`, and re-applying one
+   stacks "Fine Fine Steel Sword" on the next temper.
+
+6. **A `standing_stones.txt` table is shipped empty**, with instructions. The plan
+   forbids hardcoding guessed stone FormIDs; the table is labelling-only and restore
+   does not depend on it.
+
+7. **`Util::CountInInventory`** exists because `TESObjectREFR` has no `GetItemCount` in
+   this CommonLib fork.
+
+---
+
+## Verification not yet performed
+
+Nothing in the plan's **Verification** section has been run: no snapshot round-trip, no
+prompt-gating test, no in-game restore. The code compiles and deploys; it has not been
+exercised against a running game.
+
+Start with the plan's fastest signal — set `bSnapshot=1`, load an existing save, and
+check that `snapshots/<saveId>__<name>/manifest.json` appears. Then quickload three
+times and confirm no second snapshot is written, which exercises the anti-thrash key.
+`cgf "SaveMigrationDebug.StatusReport"` prints every gate the lifecycle consults.

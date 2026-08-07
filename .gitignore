@@ -1,0 +1,21 @@
+# Build outputs
+build/
+out/
+*.dll
+*.pdb
+*.lib
+*.exp
+
+# vcpkg
+vcpkg_installed/
+
+# IDE
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+
+# Temp
+*.log
+*.tmp
