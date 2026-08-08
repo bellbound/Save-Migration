@@ -236,33 +236,54 @@ Everything up to and including the main menu:
 - No crash: no `crash-*.log` for the session, process healthy through the whole
   boot.
 
-### Not verified: anything that needs a loaded save
+### Verified: a full snapshot round-trip (2026-08-08, no headset)
 
-**Blocked on hardware, not on the code.** With no headset connected the modlist
-runs on `ocu-headless-layer`'s fake OpenXR session. The game boots and renders
-fine, but Skyrim VR's main menu takes no keyboard input in that state — measured
-across four independent paths, all delivered successfully and all ignored:
+Loaded `Save8_…SolitudeBluePalace…ess` (Bittercup, level 16, game day 52.61) from
+the main menu and the harvest ran end to end:
 
-| Path | Result |
-|---|---|
-| `SendInput` scan codes (Enter, E, Space, Down), game window foregrounded and confirmed owned by `SkyrimVR.exe` | no effect |
-| `SendInput` virtual keys (`VK_RETURN`) | no effect |
-| `PostMessage` `WM_KEYDOWN`/`WM_CHAR`/`WM_KEYUP` straight to the window | no effect |
-| Screenshot key (`DIK_SYSRQ`), used as an input oracle | no `ScreenShot*.bmp` written — the game consumed nothing |
+```
+SnapshotOrchestrator: harvest of 32 category/categories took 80 ms
+SkyrimNetSideCar: snapshot done - 12419072 bytes of database,
+                  9839794 bytes of prompts, schema v19, 725 embedding row(s) dropped
+SnapshotWriter: wrote …\snapshots\1786164098068-627467__Bittercup (33 categories, 0 failed)
+ReportWriter: wrote …\SKSE\SaveMigration\export_report_….txt
+```
 
-That matches `skse/ocu-headless-layer/STATUS.md`, which lists **the controller
-path** as an untested remaining item. The menu is controller-driven; with the
-layer supplying static poses and no buttons, nothing can select "Continue".
+- **0 failed categories**, no `[warn]`, no `[error]`, no `crash-*.log`.
+- Every category `ok` except `npc.outfit_dudestia`, correctly `skipped` as
+  *unavailable: missing script 'DudestiaOutfitChangerSubject'* — not installed.
+- `manifest.json`, `loadorder.json`, 17 `player/*.json`, 12 `npcs/*.json`, both
+  report formats, and the SkyrimNet side-car (DB + prompt archive) all landed.
+- Harvest cost **80 ms** on the game thread, ~2135 mods, 25-actor roster.
 
-So the remaining verification needs the Quest 3 on. With it connected:
+`world.cleared_locations` on real data — 1629 locations scanned, 3 with history:
 
-1. Load an existing save and check
-   `snapshots/<saveId>__<name>/manifest.json` appears, alongside
-   `player/world.cleared_locations.json`.
-2. Quickload three times and confirm no second snapshot is written — that is the
-   anti-thrash key.
-3. `cgf "SaveMigrationDebug.StatusReport"` prints every gate the lifecycle
-   consults.
+| Location | `cleared` | `everCleared` |
+|---|---|---|
+| Hall of the Vigilant | false | **true** |
+| Peak's Shade Tower | true | true |
+| Ilinalta's Deep | true | true |
+
+Hall of the Vigilant is precisely the case the two-flag design exists for: cleared
+once and since respawned. A category recording only `cleared` would have dropped
+it from the snapshot entirely.
+
+Note the snapshot is written through the MO2 VFS, so it lands in
+`MGON\overwrite\SKSE\Plugins\SaveMigration\snapshots\`, **not** in the game folder
+the log line names.
+
+### Still not exercised
+
+- **The anti-thrash gate** — load twice, confirm the second load writes nothing.
+  Not forced: the only way to trigger a second load from outside is a quicksave,
+  and this modlist deliberately ships *Disable Auto Save*. Writing save files into
+  a live playthrough to test a gate that is plainly readable in
+  `SnapshotOrchestrator::ShouldTake` is a bad trade; the next real load exercises
+  it for free.
+- **The entire restore direction.** `bSnapshot=0` against a genuinely new game has
+  never been run. This is the big one.
+- `cgf "SaveMigrationDebug.StatusReport"` prints every gate the lifecycle
+  consults, if the gating ever needs inspecting from in game.
 
 ### Launch notes worth keeping
 
@@ -276,3 +297,9 @@ So the remaining verification needs the Quest 3 on. With it connected:
 - The game window exists and is findable, but only via `EnumWindows` matching
   class `Skyrim VR`. `FindWindowW("Skyrim VR", …)` returns 0 and
   `Process.MainWindowHandle` is 0.
+- **Driving the main menu works with no headset.** An earlier revision of this
+  file claimed the opposite. It was wrong: the injected keys were empty events,
+  because `$input.ki.wScan = 0x1C` in PowerShell mutates a copy of the nested
+  struct and `SendInput` still returns success. Build the `INPUT` in C# —
+  `temp/input-native.ps1` — and two Enters load the most recent save exactly as
+  documented. See the workspace `AGENTS.md` for the full trap.
