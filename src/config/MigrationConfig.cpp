@@ -26,6 +26,8 @@ void MigrationConfig::Initialize() {
     storage->RegisterIntOption(Keys::kMinSnapshotIntervalSec, 120);
     storage->RegisterIntOption(Keys::kIncludeSkyrimNetDb, 1);
     storage->RegisterIntOption(Keys::kMaxSideCarMb, 2048);
+    storage->RegisterIntOption(Keys::kVmReadyTimeoutSec, 120);
+    storage->RegisterIntOption(Keys::kVmSettleDelayMs, 3000);
 
     storage->RegisterIntOption(Keys::kNeverAsk, 0);
     storage->RegisterIntOption(Keys::kMaxLevelForRestore, 3);
@@ -62,6 +64,14 @@ bool MigrationConfig::IncludeSkyrimNetDb() { return GetBool(Keys::kIncludeSkyrim
 
 int MigrationConfig::MaxSideCarMb() {
     return std::clamp(Storage()->GetInt(Keys::kMaxSideCarMb, 2048), 0, 65536);
+}
+
+int MigrationConfig::VmReadyTimeoutSec() {
+    return std::clamp(Storage()->GetInt(Keys::kVmReadyTimeoutSec, 120), 0, 600);
+}
+
+int MigrationConfig::VmSettleDelayMs() {
+    return std::clamp(Storage()->GetInt(Keys::kVmSettleDelayMs, 3000), 0, 60000);
 }
 
 bool MigrationConfig::NeverAsk() { return GetBool(Keys::kNeverAsk, false); }

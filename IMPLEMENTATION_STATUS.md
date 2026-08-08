@@ -50,7 +50,8 @@ sets a session flag that offset-dependent readers consult.
 - `core/Worker` — one owned, joined worker thread.
 - `core/LifecycleController` — the full state machine, every gate, the 3-button
   prompt with loading-screen re-arms.
-- `core/SnapshotOrchestrator` — single-`AddTask` harvest, anti-thrash state key.
+- `core/SnapshotOrchestrator` — single-`AddTask` harvest, anti-thrash state key,
+  and the **VM-ready wait** described below.
 - `core/RestoreOrchestrator` — phase-chained apply, per-frame continuation.
 - `model/SnapshotDocument` — B1 invariant **enforced**, not just documented: a
   `Members()` tuple plus a `static_assert` that every member is
@@ -97,6 +98,23 @@ hands), used by both the player and every NPC.
   `AddObjectToContainer` needs no 3D and `EquipObject` silently no-ops without it.
 - Map marker flags are re-asserted on **every** `kPostLoadGame`, making `.ess`
   persistence of `ExtraMapMarker` irrelevant to correctness.
+- The harvest **waits for the Papyrus VM** and gives categories a chance to
+  dispatch VM work first. `kPostLoadGame` fires while the VM is still suspended:
+  a loading screen may be up, and loading an older save raises a blocking
+  SkyrimNet prompt that stops the VM until the player answers. `Take()` polls
+  `Utility.IsInMenuMode` — a vanilla global native whose answer proves the VM is
+  pumping *and* that no menu owns the screen — then calls `PrepareCollect` on
+  every available category, waits `iVmSettleDelayMs`, and only then harvests.
+  One probe is in flight at a time, because probes queued against a suspended VM
+  all answer at once when it resumes. On timeout (`iVmReadyTimeoutSec`, default
+  120 s) it harvests anyway and says so in the log, the report and
+  `manifest.diagnostics.vmWait` — a partial snapshot beats none, but it must not
+  be silent.
+- **Anything that reads another mod through Papyrus primes in `PrepareCollect`,
+  never in `Collect`.** The harvest is one game-thread task, so a call dispatched
+  inside it cannot answer before it ends. `npc.tng` used to dispatch from its
+  collector and its callbacks only logged; every snapshot recorded
+  `capturePending: true` and nothing else while the report said `ok`.
 - Cleared locations carry **both** `BGSLocation::cleared` and `everCleared` —
   restoring only the former passes the map icon and fails every radiant-quest
   condition that reads the latter. Restore only ever *sets*: a target save that
@@ -267,6 +285,37 @@ ReportWriter: wrote …\SKSE\SaveMigration\export_report_….txt
 Hall of the Vigilant is precisely the case the two-flag design exists for: cleared
 once and since respawned. A category recording only `cleared` would have dropped
 it from the snapshot entirely.
+
+### Verified: the VM-ready wait (2026-08-08, second run)
+
+Same save, with the wait in place:
+
+```
+07:15:46.178  LifecycleController: taking a snapshot
+07:15:47.057  SnapshotOrchestrator: VM ready (Utility.IsInMenuMode answered false), harvesting in 3000 ms
+07:15:47.058  SnapshotOrchestrator: primed 31 available category/categories
+07:15:47.678  NpcTng: primed player addon form 0x1B~LDD_BNPTRX_TheNewGentleman…ST.esp
+07:15:47.693  NpcTng: primed player size 3
+07:15:50.149  harvest of 32 category/categories took 79 ms
+07:15:50.673  SnapshotWriter: wrote …1786166137955-413266__Bittercup (33 categories, 0 failed)
+```
+
+TNG answered **2.5 s before** the harvest instead of 0.6 s after it, and the
+payload now holds real values instead of a pending marker:
+
+```json
+{ "addon": "0x1B~LDD_BNPTRX_TheNewGentleman_Racialpenisvariances ST.esp",
+  "size": 3, "capturePending": false }
+```
+
+`manifest.diagnostics.vmWait` records
+`Utility.IsInMenuMode answered false; settled 3000 ms`. Arming to VM-ready took
+0.9 s on a clean load — the wait costs nothing when the VM is already up. No
+warnings, no errors, no crash.
+
+Note this also fixed a second bug it exposed: the applier read `payload["addonForm"]`,
+a key nothing ever wrote, so the addon half of a TNG restore was a no-op even
+given a good snapshot. Both sides now use `addon`.
 
 Note the snapshot is written through the MO2 VFS, so it lands in
 `MGON\overwrite\SKSE\Plugins\SaveMigration\snapshots\`, **not** in the game folder

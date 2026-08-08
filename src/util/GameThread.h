@@ -1,6 +1,8 @@
 #pragma once
 
+#include <chrono>
 #include <functional>
+#include <thread>
 
 namespace SaveMigration::Util {
 
@@ -26,6 +28,19 @@ inline void OnGameThread(std::function<void()> fn) {
             spdlog::error("GameThread: task threw a non-std exception");
         }
     });
+}
+
+/// Run `fn` on the game thread after `delayMs`.
+///
+/// A detached timer thread, never a sleep on the game thread: the things worth
+/// waiting for here (a loading screen finishing, the Papyrus VM resuming) are
+/// pumped *by* the game thread, so sleeping on it waits for something that can
+/// then never happen. Same pattern as `LifecycleController::ArmPrompt`.
+inline void OnGameThreadAfter(uint32_t delayMs, std::function<void()> fn) {
+    std::thread([delayMs, fn = std::move(fn)]() mutable {
+        std::this_thread::sleep_for(std::chrono::milliseconds(delayMs));
+        OnGameThread(std::move(fn));
+    }).detach();
 }
 
 }  // namespace SaveMigration::Util

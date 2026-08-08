@@ -11,6 +11,7 @@
 #include "core/Worker.h"
 #include "model/SnapshotDocument.h"
 #include "papyrus/ModProbe.h"
+#include "papyrus/PapyrusInterface.h"
 #include "report/ReportSink.h"
 #include "report/ReportWriter.h"
 #include "store/LoadOrderFingerprint.h"
@@ -112,9 +113,125 @@ void SnapshotOrchestrator::Take(std::string_view savePath) {
         spdlog::warn("SnapshotOrchestrator: Take() while already in flight");
         return;
     }
-    // One AddTask for the whole harvest: internal consistency depends on the
-    // world not advancing partway through.
-    Util::OnGameThread([this, path = std::string(savePath)]() mutable { RunHarvest(std::move(path)); });
+    Util::OnGameThread([this, path = std::string(savePath)]() mutable {
+        m_harvestStarted = false;
+        m_probeOutstanding.reset();
+        m_vmWaitNote.clear();
+        AwaitVm(std::move(path), 0);
+    });
+}
+
+void SnapshotOrchestrator::AwaitVm(std::string savePath, uint32_t attempt) {
+    if (m_harvestStarted) {
+        return;
+    }
+
+    const auto timeoutSec = Config::MigrationConfig::VmReadyTimeoutSec();
+    if (timeoutSec <= 0) {
+        OnVmReady(std::move(savePath), "wait disabled (iVmReadyTimeoutSec=0)");
+        return;
+    }
+
+    const auto maxAttempts =
+        static_cast<uint32_t>((static_cast<int64_t>(timeoutSec) * 1000) / kVmProbeIntervalMs);
+    if (attempt >= maxAttempts) {
+        // Harvesting a document with some VM-sourced fields missing beats
+        // harvesting nothing, so this is a warning and not an abort - but it has
+        // to be visible, because it is exactly the condition that silently
+        // produced a "capture pending" TNG payload.
+        spdlog::warn(
+            "SnapshotOrchestrator: Papyrus VM never answered within {} s; harvesting anyway. "
+            "Categories that read another mod through Papyrus may record nothing.",
+            timeoutSec);
+        OnVmReady(std::move(savePath),
+                  std::format("timed out after {} s - VM never answered", timeoutSec));
+        return;
+    }
+
+    // Cheap engine-side checks first. While a loading screen is up or the game is
+    // paused by a modal there is no point dispatching at all: the call would just
+    // sit in the VM's queue.
+    auto* ui = RE::UI::GetSingleton();
+    const bool loading = ui && ui->IsMenuOpen(RE::LoadingMenu::MENU_NAME);
+    const bool paused = ui && ui->GameIsPaused();
+
+    if (!loading && !paused) {
+        if (!m_probeOutstanding || !m_probeOutstanding->load()) {
+            auto outstanding = std::make_shared<std::atomic<bool>>(true);
+            m_probeOutstanding = outstanding;
+
+            // `Utility.IsInMenuMode` is the probe because it is a vanilla global
+            // native that answers cheaply, and its answer is *also* the menu
+            // check - a VM that replies "not in menu mode" has both resumed and
+            // left the blocking prompt behind.
+            const bool dispatched =
+                Papyrus::PapyrusInterface::GetSingleton()->CallGlobalFunctionBool(
+                    "Utility", "IsInMenuMode", {},
+                    [this, savePath, outstanding](bool inMenuMode) {
+                        outstanding->store(false);
+                        if (inMenuMode) {
+                            return;  // VM is alive but a menu still owns the screen
+                        }
+                        Util::OnGameThread([this, savePath]() mutable {
+                            OnVmReady(std::move(savePath), "Utility.IsInMenuMode answered false");
+                        });
+                    });
+            if (!dispatched) {
+                outstanding->store(false);
+            }
+        }
+    }
+
+    Util::OnGameThreadAfter(kVmProbeIntervalMs,
+                            [this, savePath = std::move(savePath), attempt]() mutable {
+                                AwaitVm(std::move(savePath), attempt + 1);
+                            });
+}
+
+void SnapshotOrchestrator::OnVmReady(std::string savePath, std::string_view detail) {
+    if (m_harvestStarted) {
+        return;  // a queued probe answering late
+    }
+    m_harvestStarted = true;
+
+    const auto settleMs = static_cast<uint32_t>(Config::MigrationConfig::VmSettleDelayMs());
+    m_vmWaitNote = std::format("{}; settled {} ms", detail, settleMs);
+    spdlog::info("SnapshotOrchestrator: VM ready ({}), harvesting in {} ms", detail, settleMs);
+
+    // Let every category dispatch its VM round-trips *now*, so the settle delay
+    // is the window their answers land in. A category that dispatches from
+    // Collect instead gets its answer after the document is already serialised.
+    auto* player = RE::PlayerCharacter::GetSingleton();
+    auto& registry = CategoryRegistry::Get();
+    uint32_t primed = 0;
+    for (const auto& entry : registry.Ordered()) {
+        const auto& descriptor = entry.Describe();
+        if (registry.IsDisabled(descriptor.id) || !entry.IsAvailable()) {
+            continue;
+        }
+        try {
+            if (entry.global) {
+                entry.global->PrepareCollect(player);
+            } else {
+                entry.actor->PrepareCollect(player);
+            }
+            ++primed;
+        } catch (const std::exception& e) {
+            spdlog::error("SnapshotOrchestrator: PrepareCollect for '{}' threw: {}", descriptor.id,
+                          e.what());
+        }
+    }
+    spdlog::debug("SnapshotOrchestrator: primed {} available category/categories", primed);
+
+    if (settleMs == 0) {
+        // One AddTask for the whole harvest: internal consistency depends on the
+        // world not advancing partway through.
+        RunHarvest(std::move(savePath));
+        return;
+    }
+    Util::OnGameThreadAfter(settleMs, [this, savePath = std::move(savePath)]() mutable {
+        RunHarvest(std::move(savePath));
+    });
 }
 
 void SnapshotOrchestrator::ContributeRosterSource(Util::ActorEnum::ExtraSource source) {
@@ -154,6 +271,10 @@ void SnapshotOrchestrator::RunHarvest(std::string savePath) {
     doc->gameRuntime = REL::Module::IsVR() ? "VR" : (REL::Module::IsAE() ? "AE" : "SE");
     doc->layoutSuspect = VRLayoutProbe::Get().IsLayoutTrusted() ? 0u : 1u;
     doc->diagnostics["vrLayoutProbe"] = VRLayoutProbe::Get().Detail();
+    // How the VM wait ended. A snapshot taken after a timeout is still a
+    // snapshot, but anything sourced through Papyrus in it is suspect, and the
+    // importer should be able to see that without reading the log.
+    doc->diagnostics["vmWait"] = m_vmWaitNote;
 
     if (auto* base = player->GetActorBase()) {
         const char* name = base->GetFullName();

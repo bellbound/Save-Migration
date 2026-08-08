@@ -28,6 +28,13 @@ public:
     static int MinSnapshotIntervalSec();
     static bool IncludeSkyrimNetDb();
     static int MaxSideCarMb();
+    /// How long to wait for the Papyrus VM to start answering before harvesting
+    /// anyway. 0 disables the wait entirely.
+    static int VmReadyTimeoutSec();
+    /// Settle time after the VM first answers, before the harvest runs. The VM
+    /// answering means it is *pumping*; it does not mean other mods' post-load
+    /// work has finished.
+    static int VmSettleDelayMs();
 
     // ── [Restore] ─────────────────────────────────────────────────────────
     static bool NeverAsk();
@@ -76,6 +83,8 @@ constexpr std::string_view kSnapshot = "General:bSnapshot";
 constexpr std::string_view kMinSnapshotIntervalSec = "Snapshot:iMinSnapshotIntervalSec";
 constexpr std::string_view kIncludeSkyrimNetDb = "Snapshot:bIncludeSkyrimNetDb";
 constexpr std::string_view kMaxSideCarMb = "Snapshot:iMaxSideCarMb";
+constexpr std::string_view kVmReadyTimeoutSec = "Snapshot:iVmReadyTimeoutSec";
+constexpr std::string_view kVmSettleDelayMs = "Snapshot:iVmSettleDelayMs";
 
 constexpr std::string_view kNeverAsk = "Restore:bNeverAsk";
 constexpr std::string_view kMaxLevelForRestore = "Restore:iMaxLevelForRestore";

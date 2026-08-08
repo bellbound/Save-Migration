@@ -23,9 +23,16 @@ namespace SaveMigration::Categories {
 /// The INI is never written directly. TNG's `SaveMainIni` rewrites the whole file
 /// from memory on every `kSaveGame`, so a direct write would be discarded at the next
 /// save.
+/// **The capture is primed, not dispatched from `CollectActor`.** TNG answers
+/// only through Papyrus, and the harvest is one game-thread task — a call made
+/// inside it cannot answer before it ends. Dispatching from the collector wrote
+/// `capturePending: true` and nothing else, on every single snapshot, while the
+/// report cheerfully said `ok`. `PrepareCollect` runs `iVmSettleDelayMs` earlier,
+/// once the VM is known to be answering, and `CollectActor` reads what landed.
 class NpcTng final : public Core::IActorCategory {
 public:
     [[nodiscard]] const Core::CategoryDescriptor& Describe() const override;
+    void PrepareCollect(RE::PlayerCharacter* player) override;
     void CollectActor(const Model::ActorSubject& subject, Core::CollectContext& ctx) override;
     void ApplyActor(const Model::ActorSubject& subject, Core::ApplyContext& ctx) override;
     bool ApplyDeferred(const Model::ActorSubject& subject, Core::ApplyContext& ctx) override;

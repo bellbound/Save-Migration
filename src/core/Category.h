@@ -156,6 +156,15 @@ public:
     /// only when availability needs something the requirement cannot express.
     [[nodiscard]] virtual bool IsAvailable() const;
 
+    /// Optional: dispatch asynchronous work whose answer `Collect` will need.
+    ///
+    /// Called once the Papyrus VM is answering and `iVmSettleDelayMs` *before*
+    /// the harvest, so a VM round-trip has time to land. Anything that reads
+    /// another mod through Papyrus must prime here — the harvest is a single
+    /// game-thread task, so a call dispatched inside `Collect` cannot possibly
+    /// answer before `Collect` ends, and the category will record nothing.
+    virtual void PrepareCollect(RE::PlayerCharacter*) {}
+
     virtual void Collect(CollectContext& ctx) = 0;
     virtual void Apply(ApplyContext& ctx) = 0;
 
@@ -177,6 +186,11 @@ public:
 
     [[nodiscard]] virtual const CategoryDescriptor& Describe() const = 0;
     [[nodiscard]] virtual bool IsAvailable() const;
+
+    /// See `IGlobalCategory::PrepareCollect`. Only the player is passed: the
+    /// roster does not exist yet at prime time, and it is deliberately built
+    /// inside the harvest so it describes one instant.
+    virtual void PrepareCollect(RE::PlayerCharacter*) {}
 
     /// Per-category setup before the roster walk (cache handles, resolve quests).
     virtual void BeginCollect(CollectContext&) {}

@@ -1,7 +1,9 @@
 #pragma once
 
 #include <atomic>
+#include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "util/ActorEnum.h"
@@ -20,7 +22,17 @@ public:
     /// Evaluate every snapshot gate. `reasonOut` explains a refusal, for the log.
     [[nodiscard]] bool ShouldTake(std::string& reasonOut);
 
-    /// Harvest now. Call only after `ShouldTake` returned true.
+    /// Wait for the Papyrus VM, then harvest. Call only after `ShouldTake`
+    /// returned true.
+    ///
+    /// **Not immediate, deliberately.** `kPostLoadGame` fires while the VM is
+    /// still suspended — a loading screen may still be up, and loading an older
+    /// save raises a blocking SkyrimNet prompt that stops the VM until the player
+    /// answers it. Categories that read another mod's state through Papyrus
+    /// (`npc.tng`, and any future one) get no answer in that window, and
+    /// harvesting there silently records "capture pending" instead of the value.
+    /// Measured 2026-08-08: TNG's callback arrived 0.6 s *after* the snapshot was
+    /// written, and the report still said `ok`.
     void Take(std::string_view savePath);
 
     [[nodiscard]] bool IsInFlight() const { return m_inFlight.load(); }
@@ -44,9 +56,29 @@ private:
     /// player who dies repeatedly over ten minutes would clear any interval.
     [[nodiscard]] static std::string StateKey();
 
+    /// One poll of "is the VM answering yet". Game thread. Re-arms itself until
+    /// the VM answers or the timeout expires.
+    void AwaitVm(std::string savePath, uint32_t attempt);
+
+    /// The VM answered. Wait out the settle delay, then harvest. Idempotent —
+    /// probes queued while the VM was suspended all answer at once when it
+    /// resumes, and only the first may start a harvest.
+    void OnVmReady(std::string savePath, std::string_view detail);
+
     void RunHarvest(std::string savePath);
 
+    static constexpr uint32_t kVmProbeIntervalMs = 1000;
+
     std::atomic<bool> m_inFlight{false};
+    /// Guards the transition out of the wait. Game thread only, but the probe
+    /// callback arrives on the VM thread and hops back, so late answers race.
+    bool m_harvestStarted = false;
+    /// One probe in flight at a time. While the VM is suspended a probe just sits
+    /// in its queue, and re-dispatching every second would pile up a backlog that
+    /// all fires at once on resume.
+    std::shared_ptr<std::atomic<bool>> m_probeOutstanding;
+    /// How the wait ended, for the report and the manifest diagnostics.
+    std::string m_vmWaitNote;
     std::string m_lastStateKey;
     int64_t m_lastSnapshotUnixMs = 0;
     std::vector<Util::ActorEnum::ExtraSource> m_pendingExtraSources;

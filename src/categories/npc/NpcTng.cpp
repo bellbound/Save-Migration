@@ -1,6 +1,8 @@
 #include "categories/npc/NpcTng.h"
 
 #include <format>
+#include <mutex>
+#include <string>
 
 #include "defer/PendingWorkQueue.h"
 #include "model/FormRef.h"
@@ -21,6 +23,31 @@ constexpr std::string_view kTngScript = "TNG_PapyrusUtil";
 /// for the verify-and-correct path. TNG ships far fewer than this.
 constexpr int32_t kMaxAddonIndex = 64;
 
+/// What `PrepareCollect` dispatched and the VM has answered so far.
+///
+/// File-static rather than a member because the callbacks arrive on the VM
+/// thread while the collector reads on the game thread, and the category object
+/// itself is owned by the registry for the process lifetime either way.
+struct PrimedCapture {
+    std::mutex mutex;
+    bool haveAddon = false;
+    bool haveSize = false;
+    std::string addonKey;  // empty is meaningful: "no addon equipped"
+    int32_t size = 0;
+};
+
+PrimedCapture g_primed;
+
+void ResetPrimed() {
+    // Field-by-field: the struct holds a mutex, so it is neither copyable nor
+    // assignable.
+    std::lock_guard lock(g_primed.mutex);
+    g_primed.haveAddon = false;
+    g_primed.haveSize = false;
+    g_primed.addonKey.clear();
+    g_primed.size = 0;
+}
+
 }  // namespace
 
 const Core::CategoryDescriptor& NpcTng::Describe() const {
@@ -39,19 +66,13 @@ const Core::CategoryDescriptor& NpcTng::Describe() const {
     return descriptor;
 }
 
-void NpcTng::CollectActor(const Model::ActorSubject& subject, Core::CollectContext& ctx) {
-    // Only the player. NPC state already carries over: TNG keys it off the TESNPC
-    // base in a global, non-per-save INI.
-    if (!subject.isPlayer || !subject.actor) {
+void NpcTng::PrepareCollect(RE::PlayerCharacter* player) {
+    ResetPrimed();
+    if (!player) {
         return;
     }
 
     auto* papyrus = Papyrus::PapyrusInterface::GetSingleton();
-    auto& payload = ctx.ActorPayload(kId, subject.refKey);
-
-    // Async reads: the results land in the payload before the harvest is serialised
-    // because the whole harvest is one game-thread task and the VM answers within it.
-    auto* actor = subject.actor;
 
     // The *form* is what we actually store: an index is meaningless across installs.
     //
@@ -59,29 +80,89 @@ void NpcTng::CollectActor(const Model::ActorSubject& subject, Core::CollectConte
     // is a form call. There is no "GetActorAddonForm" on the script - asking for one
     // dispatched a function that does not exist and took the game down inside the VM.
     papyrus->CallGlobalFunctionForm(
-        std::string(kTngScript), "GetActorAddon", {static_cast<RE::Actor*>(actor)},
+        std::string(kTngScript), "GetActorAddon", {static_cast<RE::Actor*>(player)},
         [](RE::TESForm* form) {
-            spdlog::info("NpcTng: player addon form {}",
-                         form ? Model::FormKeyUtil::BuildFormKey(form) : "(none)");
+            const auto key = form ? Model::FormKeyUtil::BuildFormKey(form) : std::string{};
+            {
+                std::lock_guard lock(g_primed.mutex);
+                g_primed.addonKey = key;
+                g_primed.haveAddon = true;
+            }
+            spdlog::info("NpcTng: primed player addon form {}", key.empty() ? "(none)" : key);
         });
 
     // TNG also exposes the size as a plain int, which does transfer meaningfully.
     papyrus->CallGlobalFunctionInt(std::string(kTngScript), "GetActorSize",
-                                   {static_cast<RE::Actor*>(actor)}, [](int32_t size) {
-                                       spdlog::info("NpcTng: player size {}", size);
+                                   {static_cast<RE::Actor*>(player)}, [](int32_t size) {
+                                       {
+                                           std::lock_guard lock(g_primed.mutex);
+                                           g_primed.size = size;
+                                           g_primed.haveSize = true;
+                                       }
+                                       spdlog::info("NpcTng: primed player size {}", size);
                                    });
+}
 
-    // Because those are asynchronous, the payload records the *request* and the
-    // deferred applier does the read-back. Recording a value we have not received
-    // yet would write a zero.
-    payload["capturePending"] = true;
+void NpcTng::CollectActor(const Model::ActorSubject& subject, Core::CollectContext& ctx) {
+    // Only the player. NPC state already carries over: TNG keys it off the TESNPC
+    // base in a global, non-per-save INI.
+    if (!subject.isPlayer || !subject.actor) {
+        return;
+    }
+
+    auto& payload = ctx.ActorPayload(kId, subject.refKey);
+
+    bool haveAddon = false;
+    bool haveSize = false;
+    std::string addonKey;
+    int32_t size = 0;
+    {
+        std::lock_guard lock(g_primed.mutex);
+        haveAddon = g_primed.haveAddon;
+        haveSize = g_primed.haveSize;
+        addonKey = g_primed.addonKey;
+        size = g_primed.size;
+    }
+
+    if (!haveAddon && !haveSize) {
+        // The VM never answered within the settle window. Record that honestly
+        // and fail the item, rather than writing zeros that a restore would
+        // dutifully apply.
+        payload["capturePending"] = true;
+        payload["note"] =
+            "TNG answers only through Papyrus and did not reply before the harvest. Raise "
+            "Snapshot:iVmSettleDelayMs, or check that the VM was running - a blocking menu "
+            "suspends it.";
+        ctx.report.Failed(Report::PlayerSubject(), std::format("{}/tng", subject.refKey),
+                          Report::ReasonCode::kPapyrusTimeout,
+                          "TNG did not answer before the harvest; addon and size not recorded",
+                          subject.refKey, "TNG player addon");
+        return;
+    }
+
+    payload["capturePending"] = false;
+    if (haveAddon) {
+        // An empty key is a real answer - "no addon equipped" - and is stored as
+        // such so the applier can tell it apart from "never captured".
+        payload["addon"] = addonKey;
+    }
+    if (haveSize) {
+        payload["size"] = size;
+    }
     payload["note"] =
-        "TNG exposes addon and size only through Papyrus, which answers asynchronously. The values "
-        "are captured on the VM callback and reconciled on apply by reading back GetActorAddon and "
-        "comparing FormKeys - an index alone does not survive an addon being installed or removed.";
+        "Addon is stored as a FormKey, never an index: SetActorAddon takes an index into the "
+        "per-race applicable list, which shifts when addons are installed or removed. The applier "
+        "matches by name, then re-reads GetActorAddon and compares FormKeys, sweeping indices if "
+        "the name match landed wrong.";
 
     ctx.report.Succeeded(Report::PlayerSubject(), std::format("{}/tng", subject.refKey),
                          subject.refKey, "TNG player addon");
+    if (!haveAddon || !haveSize) {
+        ctx.report.Warn(Report::ReasonCode::kPapyrusTimeout,
+                        std::format("TNG answered partially - addon {}, size {}",
+                                    haveAddon ? "captured" : "MISSING",
+                                    haveSize ? "captured" : "MISSING"));
+    }
     ctx.report.Info(
         "Only the player's TNG state is migrated. NPC addons are keyed off the TESNPC base in "
         "TheNewGentleman5.ini, which is global rather than per-save, so they carry over already.");
@@ -128,7 +209,10 @@ bool NpcTng::ApplyDeferred(const Model::ActorSubject& subject, Core::ApplyContex
     const auto subjectRef = Report::PlayerSubject();
     const auto itemId = std::format("{}/tng", subject.refKey);
 
-    const auto wantedAddonKey = payload.value("addonForm", std::string{});
+    // "addon", matching what the collector writes. This read used to be
+    // "addonForm", a key nothing ever produced - so the addon half of the restore
+    // was a no-op even on a snapshot that had captured one.
+    const auto wantedAddonKey = payload.value("addon", std::string{});
     const int32_t wantedSize = payload.value("size", -1);
 
     auto* papyrus = Papyrus::PapyrusInterface::GetSingleton();
@@ -140,8 +224,14 @@ bool NpcTng::ApplyDeferred(const Model::ActorSubject& subject, Core::ApplyContex
     }
 
     if (wantedAddonKey.empty()) {
-        ctx.report.SkippedItem(subjectRef, itemId, Report::ReasonCode::kPartialByDesign,
-                               "no TNG addon form was captured, so only the size was applied");
+        // Two different situations, and the payload distinguishes them: an empty
+        // "addon" alongside capturePending=false means the character genuinely had
+        // none, which is nothing to restore.
+        const bool pending = payload.value("capturePending", true);
+        ctx.report.SkippedItem(
+            subjectRef, itemId, Report::ReasonCode::kPartialByDesign,
+            pending ? "TNG never answered at snapshot time, so only the size was applied"
+                    : "the snapshot character had no TNG addon; only the size was applied");
         return true;
     }
 
