@@ -35,10 +35,35 @@ public:
     static std::filesystem::path LiveDbPath(std::string_view saveId);
     /// `prompts/_saves/<saveId>/`, the per-playthrough prompt archive.
     static std::filesystem::path PromptArchivePath(std::string_view saveId);
+    /// The snapshot's copy of that archive.
+    static std::filesystem::path SnapshotPromptArchivePath(const std::filesystem::path& snapshotDir,
+                                                           std::string_view oldSaveId);
 
     /// The current playthrough id, from SkyrimNet's own exported accessor.
     /// Empty when SkyrimNet is absent or has not initialised.
+    ///
+    /// **This, and never `SaveIdentity::SaveId()`, is what SkyrimNet's filenames are
+    /// keyed on.** The two ids have the same shape by design but are minted
+    /// independently, so using ours would stage a database under a name SkyrimNet
+    /// never opens - silently, because the swap itself succeeds.
     static std::string CurrentSaveId();
+
+    /// Whether there is a prompt archive to offer copying. True when the snapshot
+    /// carries one, or when the old playthrough's live folder is still on disk.
+    static bool HasPromptArchive(const std::filesystem::path& snapshotDir,
+                                 std::string_view oldSaveId);
+
+    /// Whether the snapshot holds a SkyrimNet database at all. Cheap; file existence.
+    static bool HasSnapshotDb(const std::filesystem::path& snapshotDir,
+                              std::string_view oldSaveId);
+
+    /// The SkyrimNet playthrough id a snapshot was taken from, or empty.
+    ///
+    /// Needed before the snapshot document has been parsed - the prompt chain runs
+    /// well ahead of that - so it works off the files rather than the payload:
+    /// `sidecar.json` if it is there, otherwise the `SkyrimNet-<id>.db` filename,
+    /// which is what the restore path derives its own paths from anyway.
+    static std::string SnapshotOldSaveId(const std::filesystem::path& snapshotDir);
 
     // ── Snapshot ──────────────────────────────────────────────────────────
 
@@ -71,12 +96,28 @@ public:
 
     // ── Restore, phase R1 ─────────────────────────────────────────────────
 
+    /// The parts of the import the player was asked about. Defaults match what the
+    /// code did before the questions existed, so a caller that does not ask still
+    /// gets the old behaviour.
+    struct ImportOptions {
+        /// Copy `prompts/_saves/<old>` into `prompts/_saves/<new>`.
+        bool copyPromptArchive = true;
+
+        /// Rewrite the old character's name in the narrative text. Empty `from`
+        /// disables it; `from == to` is treated as disabled too.
+        std::string renameFrom;
+        std::string renameTo;
+    };
+
     struct RestoreResult {
         bool success = false;
         std::string error;
         uint32_t rowsRepaired = 0;
         uint32_t rowsDeleted = 0;
         uint32_t orphansReported = 0;
+        /// Rows whose text changed in the rename pass, summed across the tables.
+        uint32_t rowsRenamed = 0;
+        uint64_t promptBytesCopied = 0;
         std::filesystem::path pendingDbPath;
     };
 
@@ -89,6 +130,7 @@ public:
     static RestoreResult PrepareRestore(const std::filesystem::path& snapshotDir,
                                         std::string_view oldSaveId, std::string_view newSaveId,
                                         const std::vector<PluginRecord>& snapshotOrder,
+                                        const ImportOptions& options,
                                         const std::function<void(Report::ReasonCode, std::string)>&
                                             reportLine);
 };

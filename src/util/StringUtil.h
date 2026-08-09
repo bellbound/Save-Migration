@@ -49,4 +49,12 @@ std::vector<std::string> SplitAndTrim(std::string_view text, char delim = ',');
 /// all of which the engine treats case-insensitively.
 bool IEquals(std::string_view a, std::string_view b);
 
+/// A Unix millisecond stamp as local wall-clock text: "9 Aug 2026, 14:32".
+///
+/// Local rather than UTC, and no seconds: this goes in a message box where the
+/// only job is to let the player tell two exports apart. Returns "an unknown
+/// date" rather than a fake one when the stamp is zero or unconvertible — a
+/// wrong date in that sentence would mislead about which save is being offered.
+std::string FormatUnixMsLocal(int64_t unixMs);
+
 }  // namespace SaveMigration::Util

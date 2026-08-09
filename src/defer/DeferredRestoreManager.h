@@ -39,14 +39,36 @@ public:
 private:
     DeferredRestoreManager() = default;
 
+    /// One observation that something worth re-testing happened.
+    struct ReadySignal {
+        /// The subject or cell it is about. Empty means "every queued item".
+        std::string key;
+        /// Trigger bits observed, matched against `PendingItem::trigger`.
+        uint8_t triggers = 0;
+        /// Ignore the trigger mask entirely and consider every item.
+        bool matchAll = false;
+        /// Whether an item that turns out not to be ready should burn one of its
+        /// `maxAttempts`. True for a real world event - the actor loaded and was
+        /// still not equippable, which is the failure the counter exists to
+        /// bound. **False** for the blanket re-test on game load: that one fires
+        /// for every item whether or not the player is anywhere near the NPC, so
+        /// counting it would retire the whole queue after `maxAttempts` loads
+        /// without a single subject ever having been seen.
+        bool countsAsAttempt = true;
+    };
+
     /// Called by the sinks. Coalesces into one game-thread task per frame.
     void NotifySubject(const std::string& subjectKey, Trigger trigger);
     void NotifyCell(const std::string& cellKey, Trigger trigger);
+    void Signal(ReadySignal signal);
     void ScheduleDrain();
     void Drain();
 
-    /// Apply one item. Returns true to retire it.
-    bool ApplyItem(PendingItem& item, Report::ReportSink& sink);
+    /// Apply one item. Returns true to retire it. `didWork` is set when the item
+    /// got past its readiness gate and actually touched the world, which is what
+    /// the per-frame budget is counted in.
+    bool ApplyItem(PendingItem& item, Report::ReportSink& sink, bool countsAsAttempt,
+                   bool& didWork);
 
     /// Write the deferred supplement report once the queue empties.
     void WriteSupplement();
@@ -60,8 +82,8 @@ private:
     std::atomic<bool> m_drainScheduled{false};
 
     std::mutex m_readyMutex;
-    /// Trigger bits observed this frame, per subject/cell key.
-    std::vector<std::pair<std::string, uint8_t>> m_ready;
+    /// What the sinks observed this frame, coalesced into one drain.
+    std::vector<ReadySignal> m_ready;
 
     /// Accumulated across replays so the supplement report can describe the whole
     /// deferred lifetime rather than one drain.

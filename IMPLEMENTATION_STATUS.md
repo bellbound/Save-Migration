@@ -36,6 +36,302 @@ sets a session flag that offset-dependent readers consult.
 
 ---
 
+## The player-facing flow (added 2026-08-09)
+
+### The INI is shipped, not conjured
+
+The config file is now **`SaveMigration.ini`**, not `SaveMigration_config.ini`, and a
+fully commented copy ships in the mod at
+`SKSE/Plugins/SaveMigration/SaveMigration.ini`. Every key, its default and the
+reason it exists are in that file, so nobody has to read this document or the
+source to change a setting. `ConfigStorage::Initialize` gained a file-name
+parameter to allow the rename; every other project's copy of `ConfigStorage` is
+untouched and keeps the old default.
+
+The name matters because the prompts name it. A message box that says "set
+`bSnapshot=1` in SaveMigration.ini" and a file actually called something else is
+worse than no instruction at all.
+
+> An existing `SaveMigration_config.ini` under MO2's `overwrite` is now orphaned.
+> Delete it; it is read by nothing.
+
+### `[Imports]` — one switch per category, import direction only
+
+33 keys, one per registered category, derived from the id:
+`player.map_markers` → `bPlayerMapMarkers`. `MigrationConfig::ImportKeyFor` does
+the transform, `CategoryRegistry::Freeze()` registers the keys (the first moment
+the category list exists), and `RestoreOrchestrator::ApplyPhase` plus
+`DeferredRestoreManager::ApplyItem` both consult it.
+
+**This is not `sDisabledCategories`.** A category switched off in `[Imports]` is
+still *snapshotted* — the data stays in the export and can be imported later by
+switching it back on. `sDisabledCategories` silences both directions. Keeping
+them separate is the point: the export is the irreplaceable artefact, and a
+mistake in the import switches should never be able to cost you data you can no
+longer collect.
+
+An id that no key exists for reads as **enabled**. A category added in a future
+build must not be silently dropped from an import because an older INI has no
+line for it.
+
+### Prompts wait for a screen they can be seen on
+
+`core/PromptGate` is the one place that decides when a message box may go up:
+`iPromptDelayMs` elapsed, no `LoadingMenu`, no message box (ours or anyone
+else's), and the game not paused. It polls rather than trusting a fixed delay,
+because a slow load outlasts any delay worth choosing. It replaces the hand-rolled
+re-arm loop that used to live in `LifecycleController::ArmPrompt`.
+
+The pause check is *advisory*: after ten seconds of nothing else blocking it, a
+prompt goes up anyway and says so in the log. A box shows and answers perfectly
+well while the game is paused — only the Papyrus work behind it would rather the
+VM were running — and VR has more always-open menus than flat Skyrim, so a
+permanently-blocking pause must not be able to lose every prompt silently. A
+loading screen or another mod's box is never overruled; those genuinely swallow
+the box.
+
+If the gate never opens at all, the prompt is dropped **and said so** in the log
+and in game. A swallowed prompt and a broken plugin look identical otherwise.
+
+### Export: ask, do the work, then report and offer to stop asking
+
+```
+"Do you want to export the current save's Data, so it can be
+ imported in another Savegame?"
+   ├── Yes → harvest → "Export complete. … Switch export mode off now?"
+   │                      └── Yes → bSnapshot=0
+   └── No  → "Do you want to be asked again on future game loads?"
+                └── No → bSnapshot=0
+```
+
+**The "stop asking" question is asked after the export, not before it.** An
+earlier revision asked both questions up front, and it was wrong three ways:
+
+1. It asked the player to decide whether to leave export mode *before they knew
+   whether the export had worked* — and leaving export mode flips the whole
+   plugin into import mode, which is a large consequence to answer blind.
+2. It made a successful export completely silent. The player answered a prompt
+   and then nothing visible ever happened, whether it succeeded or failed.
+3. It created a genuine hazard: writing `bSnapshot=0` while the harvest the
+   player *just agreed to* had not started, with `BeginSnapshot` re-evaluating
+   the gates after its SkyrimNet roster read. That needed a
+   `SnapshotOrchestrator::ApproveOnce()` flag to suspend the mode check for one
+   run — a flag that bypasses a mode gate, which is exactly the kind of thing
+   that becomes a bug later.
+
+Doing the work first removes all three, and `ApproveOnce` with them. The
+completion box is the natural place to offer the mode switch anyway: the snapshot
+exists, the answer is informed, and turning export mode off is genuinely the next
+step in the workflow.
+
+`SnapshotOrchestrator::SetCompletionHandler` is how the result gets back — a
+one-shot, fired on the game thread and cleared as it fires, set in
+`BeginSnapshot` so no path can reach a harvest without one.
+
+The decline path keeps its "ask again?" question, because with no export to
+report there is nothing else to hang the offer on.
+
+Both boxes are still answered *before* the harvest's own work, deliberately: a
+message box pauses the game and therefore suspends the Papyrus VM, and the
+harvest's opening move is to wait for the VM to answer `Utility.IsInMenuMode`.
+Asking a question during that wait would stall the thing the question was about.
+
+`bAskBeforeExport=0` restores the old silent behaviour, with one addition: the
+result is reported as a notification. No boxes — an automatic export is not a
+conversation the player started, so finishing one at them would be an
+interruption.
+
+### Import: name the snapshot, then offer to stop asking
+
+`Save Migration: Detected Savegame Snapshot <name> from <date of export>. Do you
+want to apply the saved values to this savegame?` — Yes / No.
+
+The date is what tells two exports of the same character apart, which is why it
+is in the sentence. `Util::FormatUnixMsLocal` renders it, and says "an unknown
+date" rather than inventing one when the stamp is missing.
+
+A **No** raises a second box — `Disable asking again for this Snapshot?` — whose
+Yes appends the snapshot's directory name to `sDeclinedSnapshots`, and
+`SnapshotReader::SelectNewest` skips it from then on.
+
+**Per-snapshot, not global.** The question says "this Snapshot", so it had better
+mean it — an earlier revision wrote the global `bAskBeforeImport=0` here, which
+promised something narrower than it delivered. It is also the more useful
+behaviour: declining falls through to the next-newest snapshot rather than
+silencing the feature, and a snapshot exported *later* is a deliberate act of
+wanting to migrate and should still be offered. The list is capped at 32 entries,
+newest kept, because one unbounded INI line eventually becomes unreadable.
+
+`bAskBeforeImport` survives as the master switch for anyone who wants the import
+side silent outright. (It is the old `bNeverAsk`, renamed to match
+`bAskBeforeExport` and to read the right way round.)
+
+A **Yes** raises no second box: the import runs, `SMST.kRestoreApplied` lands in
+the co-save, and there is nothing left to stop asking about. The plugin is
+already silent on the source save (excluded by save id) and on an
+already-imported one (the co-save flag) — silent meaning log-only, no
+notification and no box.
+
+### Progress, while it runs
+
+One `DebugNotification` at most every `iProgressNotifyIntervalSec` (default 5,
+floored at 2 — the widget's own fade time, below which messages overwrite each
+other). Under 64 characters, because that is where `DebugNotification` truncates.
+The apply pass reports `importing N%` by phase; the validation pass reports
+`checking N%`.
+
+The three notifications `Finish` used to fire in one frame — reload required,
+deferred count, and now the outcome — are one message box instead. Three
+notifications in a frame means the player sees the last one and nothing else.
+
+### Validation
+
+`IGlobalCategory::Validate` / `IActorCategory::ValidateActor`, default no-op,
+run as **one pass after every phase** rather than per-category at write time. A
+value can be written correctly in phase 20 and clobbered in phase 80; checking at
+the moment of the write confirms exactly the mistakes that matter least. One
+category per frame — cheap, but 32 categories of reads in one frame is a stutter
+in VR for no gain.
+
+Implemented for the categories whose values can honestly be read back:
+
+| Category | Check | Hard? |
+|---|---|---|
+| `player.identity` | name, only when `bRestoreName=1` | yes |
+| `player.skills` | both stores, ±1 tolerance | yes |
+| `player.level` | level | yes |
+| `player.level` | perk points | **no** — perks bought after the level write spend them legitimately |
+| `player.perks` | `HasPerk` over the recorded playable set | yes |
+| `player.spells_shouts` | `HasSpell` / `HasShout`; abilities excluded | yes |
+| `player.currency` | gold count | yes |
+| `player.inventory` | that the chunked walk reached the end of the list | yes |
+
+Deliberately not done: a per-item inventory comparison. Which items are
+legitimately absent depends on `bRestoreQuestItems`, container ownership and the
+missing-plugin set, and re-deriving all three in the validator would be a second
+copy of the policy that could disagree with the first. What the chunking can
+actually get wrong is *stopping early* — the orchestrator abandons a phase that
+asks for too many continuations — and that is what is checked.
+
+Abilities are excluded from the spell check because the standing-stone pass
+deliberately removes competing doomstone abilities; including them would report a
+correct import as broken every single time.
+
+A throwing validator is caught and downgraded to a report warning. It must never
+be able to condemn a good import.
+
+### VR Editor's files — `system.vreditor_files` (added 2026-08-09)
+
+`store/VrEditorFiles` + `categories/system/VrEditorFilesCategory`, modelled on the
+SkyrimNet side-car: copy the file set into `<snapshot>/system/vreditor/<path
+relative to Data>`, write it back on import. Gated on `VREditor.dll`.
+
+Three locations are swept, because VR Editor uses all three and a snapshot that
+quietly missed one would look complete and not be:
+
+| Where | What | Restored? |
+|---|---|---|
+| `Data/` | `VREditor_*_SWAP.ini`, `*_SWAP_latest.ini` | yes |
+| `Data/SKSE/Plugins/VREditor/` | `*_AddedObjects.ini`, `VREditor_config.ini` | yes / opt-in |
+| `Data/VREditor/` | an older location, still populated on existing installs | yes |
+
+Only files matching `VREditor_*.ini` are taken from the `Data` root — it is the
+whole game data folder, and everything else in it belongs to someone else.
+
+**What this does not migrate, stated on every run.** The obvious expectation is
+wrong and the code says so in both directions (`kScopeNote`, emitted as a report
+`Info` on collect *and* apply):
+
+- `*_SWAP.ini` is read by **Base Object Swapper** at game load, globally and
+  independently of any save. Restoring it genuinely repositions the same world
+  references in the new playthrough. This is real migration.
+- `*_AddedObjects.ini` is a **log**. VR Editor's own file header says it:
+  *"this file currently only serves as a log for your added objects, the actual
+  added objects are stored in the game save file"*. The `AddedObjectsSpawner`
+  that would read it back is dead code — its header says `This is currently
+  UNUSED!` and `OnCellEnter` has no caller anywhere in the project. So the
+  record travels; the furniture does not.
+
+The placed objects live in VR Editor's co-save records (`IGPV`, `GALY`, `5VEL`).
+SKSE gives every plugin its own records with no way to read another's, and VR
+Editor exposes no interface to enumerate or re-create placements — its only
+natives are `IsInEditMode`, `EnterEditMode`, `ExitEditMode`, `ToggleEditMode` and
+`ResetCurrentCellEdits`. Carrying them would mean **an addition to VR Editor
+itself**: an API that enumerates placements as (base form, cell, transform) and
+one that re-creates them. Until that exists, saying so on every run beats a green
+tick that implies more than it delivers.
+
+`VREditor_config.ini` is snapshotted but not restored unless
+`bRestoreVrEditorConfig=1` — grid size and control bindings belong to the machine,
+not to the playthrough. Same reasoning as `bRestoreName`.
+
+Anything already on disk is renamed to `<name>.premigration` rather than
+overwritten: these files are hand-editable, and the target playthrough may have
+built something of its own.
+
+Both directions do **all** their file work on the worker, and the payload is a
+bare marker — the file list lands in `system/vreditor/index.json` next to the
+copies, exactly as the SkyrimNet side-car writes `sidecar.json`. That is not only
+the B1 boundary being observed: locating the `_SWAP.ini` files means listing the
+`Data` root, which under MO2 is a merge across ~2135 mods, and the harvest is one
+game-thread task currently measured at 80 ms.
+
+For the same reason there is deliberately **no `Validate`** here. It would run on
+the game thread at the end of the run and race the copy it was checking, so it
+would report "missing" for files that arrive a moment later. `Restore` logs its
+real outcome and raises a notification on genuine failure instead.
+
+The category is deliberately **not** in the critical table. It is another mod's
+cosmetic data, and a failure leaves the save no worse than before.
+
+### Critical vs harmless — `core/ImportOutcome`
+
+One table, in one file. The membership test is: *if this category alone failed,
+would playing on give the player a character that is permanently wrong, with no
+way to fix it by playing?*
+
+Critical: `player.identity`, `player.skills`, `player.level`, `player.perks`,
+`player.spells_shouts`, `player.attributes`, `player.attributes_reassert`,
+`player.currency`, `player.inventory`, `player.equipment`, and `_orchestrator`
+(a phase abandoned mid-way is by definition a partial write). They run as a
+dependency chain — skills gate perks, level gates perk availability — and half a
+chain applied cannot be repaired by playing, while the co-save flag means the
+import will not be offered again.
+
+Everything else is harmless: every per-NPC category, everything cosmetic, and
+everything that reaches into another mod. Those fail routinely against a load
+order that differs from the snapshot's, and they leave the save no worse than
+before. Naming them separately is the whole point of the distinction.
+
+Escalation needs a **wholesale** failure (`kFailed`), not a partial one. A partly
+applied critical category is listed among the harmless ones as "(partly)" —
+honest, and not grounds for an alarming box.
+
+Three outcomes:
+
+- **Snapshot unreadable** — the apply pass never started, so the save is
+  untouched. Said plainly, not alarmingly.
+- **Clean** — "import complete, make a new save now and load it before you carry
+  on", with harmless failures, soft validation notes, the deferred count and any
+  reload requirement folded in.
+- **Unsafe** — names what failed and what did not stick, then: do NOT keep
+  playing this save, load the one from before the import and try again.
+
+`kRestoreApplied` is set even on an unsafe outcome. The alternative re-offers the
+import on the next load of a save that is *already* half-written; the save the
+player is being sent back to has no such flag and will be offered it correctly.
+
+### A pre-existing bug this turned up
+
+`SMST.kRestoreInProgress` was set at the start of every restore and cleared only
+on the snapshot-load-failure path. A **successful** restore left it set, so it was
+written into the save — and `SnapshotOrchestrator::ShouldTake` refuses to harvest
+while it is set. Switching that save line back to export mode would have refused
+every snapshot for ever, with the log line "a restore is in progress" and no
+restore in progress. Cleared in `Finish` now.
+
+---
+
 ## Implemented and building
 
 ### Framework
@@ -73,7 +369,7 @@ sets a session flag that offset-dependent readers consult.
 - `papyrus/ModProbe` — plugin / script / DLL probes, resolved once.
 - `papyrus/SaveMigrationApi` + `SaveMigrationDebug.psc` — 7 debug natives.
 
-### Categories (32 registered — the plan's full set, plus cleared locations)
+### Categories (33 registered — the plan's full set, plus cleared locations and VR Editor's files)
 `system.load_order`, `npc.roster`, `player.identity`, `player.skills`,
 `player.level`, `player.perks`, `player.beast_form`, `player.spells_shouts`,
 `player.attributes`, `player.currency`, `player.inventory`, `player.equipment`,
@@ -320,6 +616,40 @@ given a good snapshot. Both sides now use `addon`.
 Note the snapshot is written through the MO2 VFS, so it lands in
 `MGON\overwrite\SKSE\Plugins\SaveMigration\snapshots\`, **not** in the game folder
 the log line names.
+
+### Not verified in game (added 2026-08-09)
+
+Everything in "The player-facing flow" above compiles and deploys, and **none of
+it has been run in game.** In particular:
+
+- **Both prompt chains.** The export pair and the import pair have never been
+  shown. The thing to watch is `PromptGate`: if `SaveMigration.log` reports
+  `never found a clear screen ... (the game being paused is still blocking)`,
+  then VR holds the pause harder than expected and `kPauseGraceAttempts` needs to
+  come down — the grace path exists for that case but has not been observed.
+- **The export completion handler.** If it never fires, an accepted export writes
+  its snapshot and then says nothing at all — which is precisely the symptom it
+  was added to fix, so the absence of the "snapshot saved" notification is the
+  test.
+- **`sDeclinedSnapshots`.** Round-tripping a declined id through the INI and back
+  out of `SelectNewest` has only been reasoned about, not observed.
+- **`system.vreditor_files`.** The sweep was written against the file layout
+  observed in `MGON\overwrite` on 2026-08-09 — `VREditor_*_AddedObjects.ini` and
+  `VREditor_config.ini` under `SKSE/Plugins/VREditor/`, older files under
+  `VREditor/`, and *no `_SWAP.ini` present at all* on that install. So the
+  `_SWAP.ini` half of the sweep, which is the half that does real work, has never
+  had a file to pick up. Worth generating one before trusting it.
+- **The validation pass and every validator in it**, which have only ever been
+  compiled. They can only produce report lines and message-box text, so the worst
+  case is a wrong verdict rather than a damaged save — but a wrong *unsafe*
+  verdict tells the player to abandon a good save, which is the one to watch for.
+- **`[Imports]`**, including the claim that the shipped INI's 32 key names match
+  `ImportKeyFor` exactly. That was checked mechanically against the derivation,
+  not observed in a log. `ConfigStorage` writes a missing key on registration, so
+  a mismatch would show up as *duplicate-looking* keys in the INI after first run
+  rather than as an error.
+- Whether SimpleIni preserves the shipped comments across the runtime writes that
+  "stop asking" performs.
 
 ### Still not exercised
 

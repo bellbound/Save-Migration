@@ -434,12 +434,27 @@ bool NpcHomeMhiyh::ApplyDeferred(const Model::ActorSubject& subject, Core::Apply
     if (!subject.actor || !subject.actor->Is3DLoaded()) {
         return false;  // still not loaded: retry
     }
-    // Re-enter the single-slot path by seeding the queue with just this subject.
+
+    // A deferred replay can land *between two frames of this category's own
+    // continuation loop*: the apply pass places one home per frame, and each
+    // `ForceAlias` restarts a quest, which loads and unloads actors, which is
+    // exactly what fires the object-load event that schedules a drain. Seeding
+    // `m_pending` with this one subject and leaving it that way would then throw
+    // away every home the loop had not reached yet - silently, since the loop
+    // simply finds an empty queue on its next frame and reports itself complete.
+    //
+    // So the shared state is borrowed and handed straight back.
+    auto savedPending = std::move(m_pending);
+    const bool savedQueueBuilt = m_queueBuilt;
+
     const auto& payload = ctx.ActorPayload(kId, subject.refKey);
     m_pending.clear();
     m_pending.emplace_back(payload.value("slot", 0u), subject.refKey);
     m_queueBuilt = true;
     EndApply(ctx);
+
+    m_pending = std::move(savedPending);
+    m_queueBuilt = savedQueueBuilt;
     return true;
 }
 

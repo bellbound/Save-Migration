@@ -4,6 +4,7 @@
 
 #include "config/MigrationConfig.h"
 #include "core/SaveIdentity.h"
+#include "core/SkyrimNetImportChoices.h"
 #include "core/Worker.h"
 #include "papyrus/ModProbe.h"
 #include "store/LoadOrderFingerprint.h"
@@ -11,6 +12,7 @@
 #include "store/SnapshotPaths.h"
 #include "util/FileUtil.h"
 #include "util/GameThread.h"
+#include "util/Notice.h"
 #include "util/StringUtil.h"
 
 namespace SaveMigration::Categories {
@@ -100,22 +102,44 @@ void SkyrimNetSideCarCategory::Apply(Core::ApplyContext& ctx) {
                                 "the snapshot contains no SkyrimNet database");
         return;
     }
-    const auto newSaveId = Core::SaveIdentity::Get().SaveId();
+
+    // What the player answered to the questions asked just before this run.
+    const auto choices = Core::SkyrimNetImportChoices::Get();
+    if (choices.asked && !choices.importData) {
+        ctx.report.SkipCategory(Report::ReasonCode::kNone,
+                                "the player declined importing the SkyrimNet data");
+        return;
+    }
+
+    // SkyrimNet's own id, read from its exported accessor - *not*
+    // `SaveIdentity::SaveId()`. Both are minted the same shape but independently, so
+    // ours names a file SkyrimNet never opens: the staged database would be swapped
+    // into place successfully and then ignored for the rest of the playthrough.
+    const auto newSaveId = Store::SkyrimNetSideCar::CurrentSaveId();
     if (newSaveId.empty()) {
-        ctx.report.Failed(subject, "skyrimnet_sidecar", Report::ReasonCode::kIoError,
-                          "no target save id");
+        ctx.report.Failed(subject, "skyrimnet_sidecar", Report::ReasonCode::kModApiMissing,
+                          "SkyrimNet did not report a save id for this playthrough, so there is no "
+                          "filename to stage the database under");
         return;
     }
 
     const auto snapshotDir = Store::SnapshotPaths::SnapshotDir(ctx.doc.saveId, ctx.doc.characterName);
     const auto snapshotOrder = Store::LoadOrderFingerprint::FromJson(ctx.doc.loadOrder);
 
+    Store::SkyrimNetSideCar::ImportOptions options;
+    // An unasked run keeps the old behaviour: copy the archive, rename nothing.
+    options.copyPromptArchive = choices.asked ? choices.copyPromptArchive : true;
+    if (choices.renamePlayer) {
+        options.renameFrom = choices.oldPlayerName;
+        options.renameTo = choices.newPlayerName;
+    }
+
     // Phase R1 on the worker. R2 happens at the next kPreLoadGame, via the marker.
     Core::Worker::Get().Post("skyrimnet-restore-r1", [snapshotDir, oldSaveId, newSaveId,
-                                                     snapshotOrder]() {
+                                                     snapshotOrder, options]() {
         std::vector<std::pair<Report::ReasonCode, std::string>> lines;
         const auto result = Store::SkyrimNetSideCar::PrepareRestore(
-            snapshotDir, oldSaveId, newSaveId, snapshotOrder,
+            snapshotDir, oldSaveId, newSaveId, snapshotOrder, options,
             [&lines](Report::ReasonCode code, std::string message) {
                 lines.emplace_back(code, std::move(message));
             });
@@ -126,19 +150,23 @@ void SkyrimNetSideCarCategory::Apply(Core::ApplyContext& ctx) {
 
         if (!result.success) {
             spdlog::error("SkyrimNetSideCar: restore preparation failed: {}", result.error);
-            Util::OnGameThread([]() {
-                RE::DebugNotification("Save Migration: SkyrimNet memories could not be prepared.");
-            });
+            Util::Notice::DuringRestore(
+                "SkyrimNetSideCar",
+                "Save Migration: SkyrimNet memories could not be prepared.");
             return;
         }
 
-        Util::OnGameThread([repaired = result.rowsRepaired, deleted = result.rowsDeleted]() {
-            RE::DebugNotification(
-                std::format("Save Migration: SKYRIMNET_RELOAD_REQUIRED - save and reload once. "
-                            "{} memory link(s) repaired, {} dropped.",
-                            repaired, deleted)
-                    .c_str());
-        });
+        // Gated for the same reason as the failure line above: copying a large
+        // database can outlive the import pass, and by then the player has read
+        // the summary box - which already carries the save-and-reload
+        // instruction via `RequireReload` - and gone back to playing.
+        Util::Notice::DuringRestore(
+            "SkyrimNetSideCar",
+            std::format("Save Migration: SKYRIMNET_RELOAD_REQUIRED - save and reload once. "
+                        "{} memory link(s) repaired, {} dropped{}.",
+                        result.rowsRepaired, result.rowsDeleted,
+                        result.rowsRenamed > 0 ? std::format(", {} renamed", result.rowsRenamed)
+                                               : std::string{}));
     });
 
     ctx.report.RequireReload(

@@ -156,4 +156,52 @@ void PlayerSkills::Apply(Core::ApplyContext& ctx) {
     }
 }
 
+void PlayerSkills::Validate(Core::ApplyContext& ctx) {
+    const auto& payload = ctx.Payload(kId);
+    const auto skills = payload.find("skills");
+    if (skills == payload.end() || !skills->is_array()) {
+        return;
+    }
+
+    auto* data = Core::PlayerSkillDataOf(ctx.player);
+    auto* avOwner = ctx.player ? ctx.player->AsActorValueOwner() : nullptr;
+    if (!data || !avOwner) {
+        ctx.ReportValidation("skills", "the skill block could not be read back");
+        return;
+    }
+
+    uint32_t drifted = 0;
+    for (const auto& entry : *skills) {
+        const auto index = entry.value("index", uint32_t{kSkillCount});
+        if (index >= kSkillCount) {
+            continue;
+        }
+        const auto wanted = entry.value("level", 0.0f);
+        if (!std::isfinite(wanted) || wanted < 0.0f || wanted > 1000.0f) {
+            continue;  // never written in the first place; Apply already said so
+        }
+        const float fromBlock = data->skills[index].level;
+        const float fromAv = avOwner->GetBaseActorValue(SkillToActorValue(index));
+        // One point of tolerance, not zero: legitimate play between the write and
+        // this check - a lockpick, a spell cast - can move a skill by a fraction,
+        // and flagging that as a failed import would be wrong.
+        if (std::abs(fromBlock - wanted) <= 1.0f && std::abs(fromAv - wanted) <= 1.0f) {
+            continue;
+        }
+        ++drifted;
+        if (drifted <= 3) {
+            // Only the first few are named: the summary box has to stay readable,
+            // and the report file carries all of them regardless.
+            ctx.ReportValidation(
+                std::string(entry.value("name", "a skill")),
+                std::format("expected {:.0f}, found {:.0f} (stat menu) / {:.0f} (actor value)",
+                            wanted, fromBlock, fromAv));
+        }
+    }
+    if (drifted > 3) {
+        ctx.ReportValidation("skills",
+                             std::format("{} skills did not keep the imported level", drifted));
+    }
+}
+
 }  // namespace SaveMigration::Categories

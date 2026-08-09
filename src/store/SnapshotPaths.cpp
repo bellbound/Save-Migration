@@ -54,6 +54,10 @@ fs::path SnapshotPaths::SkyrimNetDir(const fs::path& snapshotDir) {
     return snapshotDir / "system" / "skyrimnet";
 }
 
+fs::path SnapshotPaths::VrEditorDir(const fs::path& snapshotDir) {
+    return snapshotDir / "system" / "vreditor";
+}
+
 fs::path SnapshotPaths::ReportsDir(const fs::path& snapshotDir) { return snapshotDir / "reports"; }
 
 fs::path SnapshotPaths::RestoreReceipt(const fs::path& snapshotDir) {

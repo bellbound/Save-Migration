@@ -23,7 +23,7 @@ ConfigStorage* ConfigStorage::GetSingleton()
     return &instance;
 }
 
-void ConfigStorage::Initialize(std::string_view modName)
+void ConfigStorage::Initialize(std::string_view modName, std::string_view fileName)
 {
     std::lock_guard<std::mutex> lock(m_mutex);
 
@@ -35,14 +35,16 @@ void ConfigStorage::Initialize(std::string_view modName)
 
     m_modName = modName;
 
-    // Build path: Data\SKSE\Plugins\<ModName>\<ModName>_config.ini
+    // Build path: Data\SKSE\Plugins\<ModName>\<fileName>
     char pathBuffer[MAX_PATH];
     GetModuleFileNameA(nullptr, pathBuffer, MAX_PATH);
     std::string exePath(pathBuffer);
     std::string dataPath = exePath.substr(0, exePath.rfind('\\'));
 
     m_iniFolderPath = fmt::format("{}\\Data\\SKSE\\Plugins\\{}", dataPath, m_modName);
-    m_iniPath = fmt::format("{}\\{}_config.ini", m_iniFolderPath, m_modName);
+    m_iniPath = fileName.empty()
+        ? fmt::format("{}\\{}_config.ini", m_iniFolderPath, m_modName)
+        : fmt::format("{}\\{}", m_iniFolderPath, fileName);
 
     spdlog::info("ConfigStorage: Initialized for '{}' at '{}'", m_modName, m_iniPath);
     m_initialized = true;

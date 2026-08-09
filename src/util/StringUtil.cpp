@@ -4,6 +4,8 @@
 
 #include <array>
 #include <cctype>
+#include <ctime>
+#include <format>
 
 namespace SaveMigration::Util {
 
@@ -212,6 +214,29 @@ bool IEquals(std::string_view a, std::string_view b) {
         }
     }
     return true;
+}
+
+std::string FormatUnixMsLocal(int64_t unixMs) {
+    constexpr std::string_view kUnknown = "an unknown date";
+    if (unixMs <= 0) {
+        return std::string(kUnknown);
+    }
+
+    const auto seconds = static_cast<std::time_t>(unixMs / 1000);
+    std::tm local{};
+    // localtime_s over localtime: the latter returns a pointer into a shared
+    // static buffer, and this can be called from the worker thread.
+    if (localtime_s(&local, &seconds) != 0) {
+        return std::string(kUnknown);
+    }
+
+    static constexpr const char* kMonths[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                                              "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+    if (local.tm_mon < 0 || local.tm_mon > 11) {
+        return std::string(kUnknown);
+    }
+    return std::format("{} {} {}, {:02}:{:02}", local.tm_mday, kMonths[local.tm_mon],
+                       local.tm_year + 1900, local.tm_hour, local.tm_min);
 }
 
 }  // namespace SaveMigration::Util

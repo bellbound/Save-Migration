@@ -47,6 +47,9 @@ public:
     static std::filesystem::path ActorCategory(const std::filesystem::path& snapshotDir,
                                                std::string_view categoryId);
     static std::filesystem::path SkyrimNetDir(const std::filesystem::path& snapshotDir);
+    /// VR Editor's own files, stored under their path relative to `Data/` so a
+    /// restore can put each one back where its reader looks for it.
+    static std::filesystem::path VrEditorDir(const std::filesystem::path& snapshotDir);
     static std::filesystem::path ReportsDir(const std::filesystem::path& snapshotDir);
     static std::filesystem::path RestoreReceipt(const std::filesystem::path& snapshotDir);
 

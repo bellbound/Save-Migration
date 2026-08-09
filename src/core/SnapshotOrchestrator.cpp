@@ -50,6 +50,11 @@ std::string SnapshotOrchestrator::StateKey() {
     return std::format("{}|{:.4f}|{}", SaveIdentity::Get().SaveId(), CurrentGameDays(), level);
 }
 
+void SnapshotOrchestrator::SetCompletionHandler(
+    std::function<void(const CompletionInfo&)> handler) {
+    m_onComplete = std::move(handler);
+}
+
 bool SnapshotOrchestrator::ShouldTake(std::string& reasonOut) {
     if (!Config::MigrationConfig::IsSnapshotMode()) {
         reasonOut = "bSnapshot=0";
@@ -364,7 +369,26 @@ void SnapshotOrchestrator::RunHarvest(std::string savePath) {
         // Also inside the snapshot, so a snapshot directory explains itself.
         Store::SnapshotWriter::WriteReportCopy(snapshotDir, rendered.text, rendered.json);
 
+        CompletionInfo info;
+        info.success = writeResult.success;
+        info.error = writeResult.error;
+        info.snapshotId = Util::PathToUtf8String(snapshotDir.filename());
+        info.categoriesWritten = writeResult.categoriesWritten;
+        info.categoriesFailed = writeResult.categoriesFailed;
+
         m_inFlight.store(false);
+
+        // Back to the game thread before the handler runs: it puts a message box
+        // up, and the handler is cleared as it fires so a later harvest cannot
+        // inherit a stale one.
+        Util::OnGameThread([this, info]() {
+            if (!m_onComplete) {
+                return;
+            }
+            auto handler = std::move(m_onComplete);
+            m_onComplete = nullptr;
+            handler(info);
+        });
     });
 }
 

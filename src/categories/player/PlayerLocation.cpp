@@ -118,16 +118,33 @@ void PlayerLocation::Apply(Core::ApplyContext& ctx) {
         return;
     }
 
+    // Logged either side of the move because this is the one call in the whole
+    // restore that can take the main thread with it if it goes wrong.
+    spdlog::info("PlayerLocation: moving the player to '{}' at ({:.0f}, {:.0f}, {:.0f})",
+                 cellName.empty() ? cellKey : cellName, position.x, position.y, position.z);
+
     if (!Util::MoveRefTo(player, cell, worldSpace, position, rotation)) {
         ctx.report.Failed(subject, "player_location", Report::ReasonCode::kCoordsOutOfBounds,
                           "the move was refused by the sanity checks in MoveRefTo");
         return;
     }
 
-    // Make the destination the player's current cell for pathing and AI purposes.
-    if (cell) {
-        player->CenterOnCell(cell);
-    }
+    spdlog::info("PlayerLocation: the move returned; the player is in '{}'",
+                 cellName.empty() ? cellKey : cellName);
+
+    // There is deliberately no `CenterOnCell` here. It reads like a harmless
+    // "and make that the current cell", but it is the console's own `coc`
+    // routine - RELOCATION_ID(39365, 40437) - so calling it right after MoveTo
+    // starts a *second* player cell transition while the first is still in
+    // flight, on the same frame.
+    //
+    // Measured on Skyrim VR 1.4.15, 2026-08-09: a Riverwood test character
+    // restoring this snapshot's Blue Palace froze the game outright. The
+    // destination really was loading - SkyrimNet registered Erikur, Una and two
+    // Solitude guards six seconds in - but the main thread never presented
+    // another frame, and sat idle rather than busy, which is a wait and not slow
+    // work. Removing the second transition is the fix; MoveTo already sets the
+    // parent cell, which is all the pathing and AI wanted from it.
 
     ctx.report.Succeeded(subject, "player_location", cellKey,
                          cellName.empty() ? cellKey : cellName);

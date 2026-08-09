@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <functional>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -37,6 +38,24 @@ public:
 
     [[nodiscard]] bool IsInFlight() const { return m_inFlight.load(); }
 
+    /// How a harvest ended.
+    struct CompletionInfo {
+        bool success = false;
+        std::string error;
+        /// The snapshot directory's name, which is its id everywhere else.
+        std::string snapshotId;
+        uint32_t categoriesWritten = 0;
+        uint32_t categoriesFailed = 0;
+    };
+
+    /// Run once on the game thread when the snapshot has been written, then
+    /// cleared. Set it before `Take`.
+    ///
+    /// The export direction used to end in silence - the player answered a
+    /// prompt and nothing visible ever happened, successfully or otherwise. This
+    /// is how `LifecycleController` gets to say so.
+    void SetCompletionHandler(std::function<void(const CompletionInfo&)> handler);
+
     /// Debug native support: bypass the gates for a manual snapshot.
     void ForceTake(std::string_view savePath);
 
@@ -70,6 +89,8 @@ private:
     static constexpr uint32_t kVmProbeIntervalMs = 1000;
 
     std::atomic<bool> m_inFlight{false};
+    /// One-shot, cleared as it fires. Game thread only.
+    std::function<void(const CompletionInfo&)> m_onComplete;
     /// Guards the transition out of the wait. Game thread only, but the probe
     /// callback arrives on the VM thread and hops back, so late answers race.
     bool m_harvestStarted = false;

@@ -36,7 +36,12 @@ public:
     static std::vector<SnapshotSummary> ListAll();
 
     /// Newest by `manifest.takenAtUnixMs`, excluding any snapshot whose
-    /// `source.saveId` equals `excludeSaveId`.
+    /// `source.saveId` equals `excludeSaveId`, and any the user has declined
+    /// for good (`sDeclinedSnapshots`, matched on directory name).
+    ///
+    /// The declined set is a filter rather than a stop, so declining one
+    /// snapshot falls through to the next-newest instead of silencing the
+    /// feature.
     ///
     /// Filesystem mtime is deliberately not used: MO2's virtual file system
     /// makes timestamps unreliable, and a VFS-mediated copy can present a

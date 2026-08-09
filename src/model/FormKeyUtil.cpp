@@ -8,6 +8,19 @@
 
 namespace SaveMigration::Model {
 
+namespace {
+
+/// The local FormID this form would carry if `file` were the plugin that
+/// *defines* it. Mirrors `TESForm::GetLocalFormID`, but against a chosen file
+/// rather than whichever one happens to sit at `sourceFiles[0]`.
+RE::FormID LocalIdAgainst(const RE::TESForm* form, const RE::TESFile* file) {
+    RE::FormID indexBits = static_cast<RE::FormID>(file->compileIndex) << (3 * 8);
+    indexBits += static_cast<RE::FormID>(file->smallFileCompileIndex) << ((1 * 8) + 4);
+    return form->GetFormID() & ~indexBits;
+}
+
+}  // namespace
+
 std::string FormKeyUtil::BuildFormKey(RE::TESObjectREFR* ref) {
     return BuildFormKey(static_cast<RE::TESForm*>(ref));
 }
@@ -17,12 +30,65 @@ std::string FormKeyUtil::BuildFormKey(RE::TESForm* form) {
         return "";
     }
 
-    auto* file = form->GetFile(0);
-    if (!file) {
+    const auto* array = form->sourceFiles.array;
+    if (!array || array->empty()) {
         spdlog::trace("FormKeyUtil: form {:08X} has no source file (dynamic)", form->GetFormID());
         return "";
     }
-    return BuildFormKey(form->GetLocalFormID(), file->GetFilename());
+
+    // `sourceFiles` lists every plugin that touches this form, and the naive
+    // `GetFile(0)` is the *winning override*, not the plugin that defines it.
+    // For anything a patch touches those differ, and the resulting key is not
+    // merely mislabelled - it is incoherent. `GetLocalFormID` strips the
+    // defining plugin's index, so pairing that number with an override's name
+    // asks for a form the override never declared.
+    //
+    // Measured 2026-08-09: a vanilla exterior cell came out of a harvest as
+    // '0x93B6~Better Dynamic Snow SE.esp'. That plugin holds 85 CELL records
+    // and every one of them is an override - it defines no cells at all - so
+    // the key could only ever have resolved to nothing, or to something else.
+    //
+    // So each candidate is *tried* rather than assumed, through the same
+    // LookupForm the restore will use. A candidate that hands the form back is
+    // correct by construction, which is what makes this safe on VR: the
+    // ESL-versus-full-index question stays inside CommonLib, where 1.4.15 has
+    // no ESL space at all. Ties go to the earliest-loading file, so a form
+    // defined by Skyrim.esm and patched by five mods is recorded against
+    // Skyrim.esm.
+    auto* handler = RE::TESDataHandler::GetSingleton();
+    const RE::TESFile* best = nullptr;
+    RE::FormID bestLocal = 0;
+
+    for (const auto* file : *array) {
+        if (!file) {
+            continue;
+        }
+        const auto local = LocalIdAgainst(form, file);
+        if (handler && handler->LookupForm(local, file->GetFilename()) != form) {
+            continue;
+        }
+        if (!best || file->compileIndex < best->compileIndex ||
+            (file->compileIndex == best->compileIndex &&
+             file->smallFileCompileIndex < best->smallFileCompileIndex)) {
+            best = file;
+            bestLocal = local;
+        }
+    }
+
+    if (!best) {
+        // No candidate round-tripped. Fall back to the old behaviour rather than
+        // dropping the form: a key that resolves to nothing is still better than
+        // no key, because the report can name what was lost.
+        const auto* file = form->GetFile(0);
+        if (!file) {
+            return "";
+        }
+        spdlog::debug("FormKeyUtil: no source file of {:08X} round-trips; recording it against '{}'",
+                      form->GetFormID(), file->GetFilename());
+        return BuildFormKey(form->GetLocalFormID(), file->GetFilename());
+    }
+
+    return BuildFormKey(bestLocal, best->GetFilename());
 }
 
 std::string FormKeyUtil::BuildFormKey(RE::FormID localFormId, std::string_view pluginName) {

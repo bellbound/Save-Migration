@@ -54,14 +54,42 @@ void GameClock::Collect(Core::CollectContext& ctx) {
     ctx.report.Succeeded(Report::WorldSubject("Calendar"), "game_clock", "", "Game clock");
 }
 
-void GameClock::Apply(Core::ApplyContext& ctx) {
-    const int mode = Config::MigrationConfig::GameTimeMode();
-    if (mode == 0) {
-        ctx.report.SkipCategory(Report::ReasonCode::kSkippedByIni,
-                                "iGameTimeMode=0, the clock was left untouched");
+void GameClock::ApplyTimescale(Core::ApplyContext& ctx, RE::Calendar* calendar,
+                               const nlohmann::json& payload) {
+    // Timescale is a *setting*, not elapsed time, which is why it is applied
+    // whatever `iGameTimeMode` says. Nothing downstream reads it as a duration:
+    // it is the divisor the engine uses to turn real seconds into game minutes,
+    // and every mod timer expressed in game hours simply runs at the rate the
+    // player chose. Restoring it costs nothing and its absence is very visible -
+    // a character migrated from a 6x playthrough into the default 20x has days
+    // that pass three times too fast, which reads as the import having broken
+    // something.
+    const float recorded = payload.value("timescale", 0.0f);
+    if (!std::isfinite(recorded) || recorded <= 0.0f) {
+        return;  // never recorded, or recorded as nonsense: leave the setting alone
+    }
+
+    auto* global = calendar->timeScale;
+    if (!global) {
+        ctx.report.Failed(Report::WorldSubject("Calendar"), "game_timescale",
+                          Report::ReasonCode::kIoError,
+                          "the TimeScale global is not reachable from the Calendar");
         return;
     }
 
+    const float current = global->value;
+    if (std::abs(current - recorded) < 0.001f) {
+        ctx.report.Succeeded(Report::WorldSubject("Calendar"), "game_timescale", "",
+                             std::format("Timescale already {:.0f}", recorded));
+        return;
+    }
+
+    global->value = recorded;
+    ctx.report.Succeeded(Report::WorldSubject("Calendar"), "game_timescale", "",
+                         std::format("Timescale {:.0f} -> {:.0f}", current, recorded));
+}
+
+void GameClock::Apply(Core::ApplyContext& ctx) {
     const auto& payload = ctx.Payload(kId);
     if (!payload.is_object() || !payload.contains("daysPassed")) {
         ctx.report.SkipCategory(Report::ReasonCode::kNone, "no game clock in the snapshot");
@@ -71,6 +99,18 @@ void GameClock::Apply(Core::ApplyContext& ctx) {
     auto* calendar = RE::Calendar::GetSingleton();
     if (!calendar) {
         ctx.report.FailCategory(Report::ReasonCode::kIoError, "Calendar singleton unavailable");
+        return;
+    }
+
+    // Ahead of the mode check on purpose - see `ApplyTimescale`. iGameTimeMode
+    // governs *when the character is*, and the timescale is not that.
+    ApplyTimescale(ctx, calendar, payload);
+
+    const int mode = Config::MigrationConfig::GameTimeMode();
+    if (mode == 0) {
+        ctx.report.SkipCategory(Report::ReasonCode::kSkippedByIni,
+                                "iGameTimeMode=0, so the date and GameDaysPassed were left "
+                                "untouched; the timescale is applied regardless");
         return;
     }
 

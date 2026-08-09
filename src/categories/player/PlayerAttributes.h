@@ -25,6 +25,9 @@ public:
     [[nodiscard]] const Core::CategoryDescriptor& Describe() const override;
     void Collect(Core::CollectContext& ctx) override;
     void Apply(Core::ApplyContext& ctx) override;
+    /// Level and perk points, read back. Both are single integers with no
+    /// legitimate reason to move during an import, so any difference is hard.
+    void Validate(Core::ApplyContext& ctx) override;
 };
 
 /// Health, magicka, stamina and carry weight.

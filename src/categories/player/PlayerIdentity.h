@@ -15,6 +15,10 @@ public:
     [[nodiscard]] const Core::CategoryDescriptor& Describe() const override;
     void Collect(Core::CollectContext& ctx) override;
     void Apply(Core::ApplyContext& ctx) override;
+    /// Only meaningful when `bRestoreName=1`; otherwise the name was recorded
+    /// and deliberately not written, and comparing it would report the default
+    /// configuration as a failure.
+    void Validate(Core::ApplyContext& ctx) override;
 };
 
 }  // namespace SaveMigration::Categories

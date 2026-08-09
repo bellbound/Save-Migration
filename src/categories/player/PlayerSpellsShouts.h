@@ -26,6 +26,10 @@ public:
     [[nodiscard]] const Core::CategoryDescriptor& Describe() const override;
     void Collect(Core::CollectContext& ctx) override;
     void Apply(Core::ApplyContext& ctx) override;
+    /// `HasSpell` / `HasShout` over the recorded set. Abilities are excluded:
+    /// the standing-stone pass deliberately removes competing ones, so an
+    /// ability that is absent by design is not a failure.
+    void Validate(Core::ApplyContext& ctx) override;
 };
 
 }  // namespace SaveMigration::Categories

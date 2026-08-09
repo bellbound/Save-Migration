@@ -5,7 +5,9 @@
 #include <format>
 #include <unordered_set>
 
+#include "config/MigrationConfig.h"
 #include "model/FormRef.h"
+#include "model/SpellProvenance.h"
 #include "model/StandingStoneTable.h"
 #include "util/StringUtil.h"
 
@@ -89,11 +91,22 @@ void PlayerSpellsShouts::Collect(Core::CollectContext& ctx) {
             continue;  // dynamic spell: no cross-save identity
         }
         const auto type = spell->GetSpellType();
+        const auto& provenance = Model::SpellProvenance::Get();
         nlohmann::json entry{
             {"form", key},
             {"name", NameOf(spell)},
             {"type", SpellTypeName(type)},
+            // Decided here, while the source game is the one with the answers,
+            // and carried in the snapshot so the report can say why something
+            // was left out without re-deriving it. The applier re-checks anyway
+            // when the form resolves, so an older snapshot without these fields
+            // is not treated differently.
+            {"restore", provenance.ShouldRestore(spell, key)},
+            {"taughtByTome", provenance.IsTaughtByTome(spell)},
         };
+        if (const auto why = provenance.RefusalReason(spell, key); !why.empty()) {
+            entry["notRestoredBecause"] = why;
+        }
 
         if (type == RE::MagicSystem::SpellType::kAbility) {
             // Doomstones grant an *ability*, not a perk. The table only supplies
@@ -192,6 +205,10 @@ void PlayerSpellsShouts::Apply(Core::ApplyContext& ctx) {
 
     // ── Spells and abilities ──────────────────────────────────────────────
     uint32_t added = 0;
+    uint32_t heldBack = 0;
+    const bool restoreEverything = Config::MigrationConfig::RestoreModUtilitySpells();
+    const auto& provenance = Model::SpellProvenance::Get();
+
     const auto addSpellList = [&](const nlohmann::json& list, const char* kind) {
         if (!list.is_array()) {
             return;
@@ -208,6 +225,27 @@ void PlayerSpellsShouts::Apply(Core::ApplyContext& ctx) {
                 ctx.report.Failed(subject, std::format("{}/{}", kind, key), reason,
                                   std::format("{} '{}' could not be resolved", kind, name), key,
                                   name);
+                continue;
+            }
+            // Judged against the form that resolved *here*, not against the flag
+            // the snapshot carries. The two normally agree, but the target load
+            // order is the one whose answer matters - a spell with no tome in the
+            // source game may well have one here - and this also gives older
+            // snapshots the same treatment as new ones.
+            // The doomstone is the one ability that must come across. It is an
+            // ability by construction - that is how doomstones are implemented -
+            // but it is also a choice the player made at a stone, it is mutually
+            // exclusive with twelve others, and the pass above has just removed
+            // whatever the new character had. Filtering it out here would leave
+            // them with no stone at all.
+            const bool isStandingStone = Model::StandingStoneTable::Get().Lookup(key).size() > 0;
+            if (!restoreEverything && !isStandingStone && !provenance.ShouldRestore(spell, key)) {
+                ++heldBack;
+                ctx.report.SkippedItem(
+                    subject, std::format("{}/{}", kind, key), Report::ReasonCode::kPartialByDesign,
+                    std::format("'{}' was not re-granted: {}", name,
+                                provenance.RefusalReason(spell, key)),
+                    name);
                 continue;
             }
             if (!player->HasSpell(spell)) {
@@ -285,6 +323,85 @@ void PlayerSpellsShouts::Apply(Core::ApplyContext& ctx) {
 
     ctx.report.Info(std::format("{} spell(s), {} shout(s) and {} word(s) newly granted", added,
                                 shoutsAdded, wordsUnlocked));
+    if (heldBack > 0) {
+        ctx.report.Info(std::format(
+            "{} entry/entries in the snapshot's spell list were deliberately not re-granted: "
+            "passive abilities and mod utility powers. Those are handed out by whatever owns them "
+            "as soon as it initialises here, so copying them across would only tell those mods "
+            "about a state this character has not reached. Set bRestoreModUtilitySpells=1 to "
+            "restore the list verbatim instead.",
+            heldBack));
+    }
+}
+
+void PlayerSpellsShouts::Validate(Core::ApplyContext& ctx) {
+    const auto& payload = ctx.Payload(kId);
+    auto* player = ctx.player;
+    if (!player) {
+        return;
+    }
+
+    auto& resolver = Model::FormResolver::Get();
+    uint32_t missingSpells = 0;
+    std::string firstMissingSpell;
+
+    // Spells only. Abilities are skipped on purpose: the standing-stone pass
+    // removes every competing doomstone ability, so an ability that is legitimately
+    // gone would otherwise read as a failed import every single time.
+    if (const auto spells = payload.find("spells"); spells != payload.end() && spells->is_array()) {
+        for (const auto& entry : *spells) {
+            const auto key = entry.value("form", std::string{});
+            if (key.empty()) {
+                continue;
+            }
+            Report::ReasonCode reason = Report::ReasonCode::kNone;
+            auto* spell = resolver.ResolveChecked<RE::SpellItem>(key, reason);
+            if (!spell || player->HasSpell(spell)) {
+                continue;  // unresolvable was already reported by Apply
+            }
+            // A spell the applier declined on purpose is not a spell that failed
+            // to stick. Asking the same question the applier asked, rather than
+            // reading a flag off the snapshot, keeps the two from drifting apart.
+            if (!Config::MigrationConfig::RestoreModUtilitySpells() &&
+                !Model::SpellProvenance::Get().ShouldRestore(spell, key)) {
+                continue;
+            }
+            ++missingSpells;
+            if (firstMissingSpell.empty()) {
+                firstMissingSpell = entry.value("name", key);
+            }
+        }
+    }
+    if (missingSpells > 0) {
+        ctx.ReportValidation("spells",
+                             std::format("{} not known, starting with '{}'", missingSpells,
+                                         firstMissingSpell));
+    }
+
+    uint32_t missingShouts = 0;
+    std::string firstMissingShout;
+    if (const auto shouts = payload.find("shouts"); shouts != payload.end() && shouts->is_array()) {
+        for (const auto& entry : *shouts) {
+            const auto key = entry.value("form", std::string{});
+            if (key.empty()) {
+                continue;
+            }
+            Report::ReasonCode reason = Report::ReasonCode::kNone;
+            auto* shout = resolver.ResolveChecked<RE::TESShout>(key, reason);
+            if (!shout || player->HasShout(shout)) {
+                continue;
+            }
+            ++missingShouts;
+            if (firstMissingShout.empty()) {
+                firstMissingShout = entry.value("name", key);
+            }
+        }
+    }
+    if (missingShouts > 0) {
+        ctx.ReportValidation("shouts",
+                             std::format("{} not known, starting with '{}'", missingShouts,
+                                         firstMissingShout));
+    }
 }
 
 }  // namespace SaveMigration::Categories

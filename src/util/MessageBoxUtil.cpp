@@ -77,4 +77,12 @@ namespace MessageBoxUtil
     {
         Show(bodyText, {"Yes", "No", "Cancel"}, std::move(callback));
     }
+
+    bool IsAnyOpen()
+    {
+        auto* ui = RE::UI::GetSingleton();
+        // No UI singleton means no menu can be up. Reporting "open" there would
+        // wedge every caller that polls this waiting for it to clear.
+        return ui && ui->IsMenuOpen(RE::MessageBoxMenu::MENU_NAME);
+    }
 }

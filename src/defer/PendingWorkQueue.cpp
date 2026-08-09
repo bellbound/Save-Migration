@@ -63,6 +63,56 @@ void PendingWorkQueue::Replace(std::vector<PendingItem> items) {
     RebuildWatchSets();
 }
 
+void PendingWorkQueue::CommitDrain(
+    std::vector<PendingItem> survivors,
+    const std::vector<std::pair<std::string, std::string>>& processed) {
+    std::lock_guard lock(m_mutex);
+
+    // Anything in the live queue that the drain neither saw nor produced was
+    // enqueued by an applier during the pass. Wholesale replacement would throw
+    // it away - it is not in `survivors`, because `survivors` was built from a
+    // copy taken before the pass began.
+    const auto wasProcessed = [&processed](const PendingItem& item) {
+        for (const auto& [categoryId, subjectKey] : processed) {
+            if (item.categoryId == categoryId && item.subjectFormKey == subjectKey) {
+                return true;
+            }
+        }
+        return false;
+    };
+    const auto alreadyKept = [&survivors](const PendingItem& item) {
+        for (const auto& kept : survivors) {
+            if (kept.categoryId == item.categoryId &&
+                kept.subjectFormKey == item.subjectFormKey) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    uint32_t adopted = 0;
+    for (auto& live : m_items) {
+        if (wasProcessed(live) || alreadyKept(live)) {
+            continue;
+        }
+        if (survivors.size() >= kMaxPendingItems) {
+            spdlog::error("PendingWorkQueue: full at {} items; dropping '{}'/'{}' enqueued during "
+                          "the drain",
+                          kMaxPendingItems, live.categoryId, live.subjectFormKey);
+            break;
+        }
+        survivors.push_back(std::move(live));
+        ++adopted;
+    }
+    if (adopted > 0) {
+        spdlog::debug("PendingWorkQueue: carried {} item(s) enqueued during the drain", adopted);
+    }
+
+    m_items = std::move(survivors);
+    ++m_generation;
+    RebuildWatchSets();
+}
+
 void PendingWorkQueue::RebuildWatchSets() {
     // Caller holds m_mutex.
     m_watchedSubjects.clear();
@@ -77,14 +127,24 @@ void PendingWorkQueue::RebuildWatchSets() {
     }
 }
 
-std::unordered_set<std::string> PendingWorkQueue::WatchedSubjects() const {
+bool PendingWorkQueue::HasWatchedSubjects() const {
     std::lock_guard lock(m_mutex);
-    return m_watchedSubjects;
+    return !m_watchedSubjects.empty();
 }
 
-std::unordered_set<std::string> PendingWorkQueue::WatchedCells() const {
+bool PendingWorkQueue::HasWatchedCells() const {
     std::lock_guard lock(m_mutex);
-    return m_watchedCells;
+    return !m_watchedCells.empty();
+}
+
+bool PendingWorkQueue::IsWatchedSubject(const std::string& key) const {
+    std::lock_guard lock(m_mutex);
+    return m_watchedSubjects.contains(key);
+}
+
+bool PendingWorkQueue::IsWatchedCell(const std::string& key) const {
+    std::lock_guard lock(m_mutex);
+    return m_watchedCells.contains(key);
 }
 
 void PendingWorkQueue::Clear() {

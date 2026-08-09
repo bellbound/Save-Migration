@@ -125,6 +125,87 @@ std::string ColumnText(sqlite3_stmt* stmt, int column) {
     return std::string(reinterpret_cast<const char*>(text));
 }
 
+/// ASCII-only lowercase. Deliberately not `std::tolower` over every byte: a UTF-8
+/// continuation byte is not a character and handing it to a locale-aware function can
+/// change it, which would corrupt any non-Latin name.
+std::string AsciiLower(std::string_view text) {
+    std::string out(text);
+    for (char& c : out) {
+        if (c >= 'A' && c <= 'Z') {
+            c = static_cast<char>(c - 'A' + 'a');
+        }
+    }
+    return out;
+}
+
+/// Every spelling of a name that appears in the database, paired old-to-new.
+///
+/// Prose columns hold the name as typed. `memories.tags` holds a slug list, lowercased
+/// with spaces turned into either '-' or '_' - both separators occur in the same
+/// database, so both are covered rather than guessed at.
+std::vector<std::pair<std::string, std::string>> NameVariants(const std::string& from,
+                                                             const std::string& to) {
+    auto slug = [](std::string_view name, char separator) {
+        auto out = AsciiLower(name);
+        std::replace(out.begin(), out.end(), ' ', separator);
+        return out;
+    };
+
+    std::vector<std::pair<std::string, std::string>> variants;
+    auto add = [&variants](std::string a, std::string b) {
+        if (a.empty() || a == b) {
+            return;
+        }
+        for (const auto& existing : variants) {
+            if (existing.first == a) {
+                return;
+            }
+        }
+        variants.emplace_back(std::move(a), std::move(b));
+    };
+
+    add(from, to);
+    add(AsciiLower(from), AsciiLower(to));
+    add(slug(from, '-'), slug(to, '-'));
+    add(slug(from, '_'), slug(to, '_'));
+    return variants;
+}
+
+/// Rewrite every variant in one text column. Returns the number of rows changed.
+///
+/// `instr` rather than `LIKE` in the WHERE clause: `LIKE` is case-insensitive for ASCII
+/// while `REPLACE` is case-sensitive, so pairing them would count rows that were
+/// matched but not actually modified and report a rename that did not happen.
+uint32_t RenameInColumn(Db& db, std::string_view table, std::string_view column,
+                        const std::vector<std::pair<std::string, std::string>>& variants) {
+    if (!db.HasTable(table)) {
+        return 0;
+    }
+    uint32_t changed = 0;
+    const auto sql = std::format(
+        "UPDATE \"{0}\" SET \"{1}\" = REPLACE(\"{1}\", ?1, ?2) WHERE instr(\"{1}\", ?1) > 0", table,
+        column);
+    for (const auto& [from, to] : variants) {
+        sqlite3_stmt* stmt = nullptr;
+        if (sqlite3_prepare_v2(db.Handle(), sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
+            spdlog::warn("SkyrimNetSideCar: rename prepare failed for {}.{}: {}", table, column,
+                         sqlite3_errmsg(db.Handle()));
+            sqlite3_finalize(stmt);
+            continue;
+        }
+        sqlite3_bind_text(stmt, 1, from.c_str(), static_cast<int>(from.size()), SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 2, to.c_str(), static_cast<int>(to.size()), SQLITE_TRANSIENT);
+        if (sqlite3_step(stmt) == SQLITE_DONE) {
+            changed += static_cast<uint32_t>(sqlite3_changes(db.Handle()));
+        } else {
+            spdlog::warn("SkyrimNetSideCar: rename failed for {}.{}: {}", table, column,
+                         sqlite3_errmsg(db.Handle()));
+        }
+        sqlite3_finalize(stmt);
+    }
+    return changed;
+}
+
 }  // namespace
 
 fs::path SkyrimNetSideCar::LiveDbPath(std::string_view saveId) {
@@ -133,6 +214,65 @@ fs::path SkyrimNetSideCar::LiveDbPath(std::string_view saveId) {
 
 fs::path SkyrimNetSideCar::PromptArchivePath(std::string_view saveId) {
     return SkyrimNetDbSwap::SkyrimNetDataRoot() / "prompts" / "_saves" / std::string(saveId);
+}
+
+fs::path SkyrimNetSideCar::SnapshotPromptArchivePath(const fs::path& snapshotDir,
+                                                     std::string_view oldSaveId) {
+    return SnapshotPaths::SkyrimNetDir(snapshotDir) / "prompts_saves" / std::string(oldSaveId);
+}
+
+bool SkyrimNetSideCar::HasSnapshotDb(const fs::path& snapshotDir, std::string_view oldSaveId) {
+    std::error_code ec;
+    return fs::exists(
+        SnapshotPaths::SkyrimNetDir(snapshotDir) / std::format("SkyrimNet-{}.db", oldSaveId), ec);
+}
+
+std::string SkyrimNetSideCar::SnapshotOldSaveId(const fs::path& snapshotDir) {
+    const auto dir = SnapshotPaths::SkyrimNetDir(snapshotDir);
+    std::error_code ec;
+
+    // Read off the filename rather than out of sidecar.json. The restore path builds
+    // `SkyrimNet-<oldSaveId>.db` from the payload, so a file with that name *is* the
+    // payload's id - one source of truth instead of two that can disagree, and no JSON
+    // parse in a path that runs before the document is loaded.
+    //
+    // Only that exact shape: the `.pending` and `.premigration` siblings live beside the
+    // live database and never in a snapshot, but matching on the prefix alone would pick
+    // them up if they ever did.
+    if (!fs::is_directory(dir, ec)) {
+        return {};
+    }
+    for (const auto& entry : fs::directory_iterator(dir, ec)) {
+        if (ec) {
+            break;
+        }
+        if (!entry.is_regular_file(ec)) {
+            continue;
+        }
+        const auto name = entry.path().filename().string();
+        constexpr std::string_view kPrefix = "SkyrimNet-";
+        constexpr std::string_view kSuffix = ".db";
+        if (name.size() > kPrefix.size() + kSuffix.size() && name.starts_with(kPrefix) &&
+            name.ends_with(kSuffix)) {
+            return name.substr(kPrefix.size(), name.size() - kPrefix.size() - kSuffix.size());
+        }
+    }
+    return {};
+}
+
+bool SkyrimNetSideCar::HasPromptArchive(const fs::path& snapshotDir, std::string_view oldSaveId) {
+    std::error_code ec;
+    // The snapshot's copy first: it is the one guaranteed to match the database being
+    // restored. The live folder is the fallback for a snapshot taken with
+    // iMaxSideCarMb too small to include the prompts, where the originals are
+    // nevertheless still sitting there - SkyrimNet never deletes a playthrough's
+    // archive, so on the machine that played it, it is normally still present.
+    const auto fromSnapshot = SnapshotPromptArchivePath(snapshotDir, oldSaveId);
+    if (fs::is_directory(fromSnapshot, ec) && !fs::is_empty(fromSnapshot, ec)) {
+        return true;
+    }
+    const auto live = PromptArchivePath(oldSaveId);
+    return fs::is_directory(live, ec) && !fs::is_empty(live, ec);
 }
 
 std::string SkyrimNetSideCar::CurrentSaveId() {
@@ -331,7 +471,7 @@ SkyrimNetSideCar::SnapshotResult SkyrimNetSideCar::TakeSnapshot(const fs::path& 
 
 SkyrimNetSideCar::RestoreResult SkyrimNetSideCar::PrepareRestore(
     const fs::path& snapshotDir, std::string_view oldSaveId, std::string_view newSaveId,
-    const std::vector<PluginRecord>& snapshotOrder,
+    const std::vector<PluginRecord>& snapshotOrder, const ImportOptions& options,
     const std::function<void(Report::ReasonCode, std::string)>& reportLine) {
     RestoreResult result;
 
@@ -463,6 +603,60 @@ SkyrimNetSideCar::RestoreResult SkyrimNetSideCar::PrepareRestore(
         sqlite3_finalize(stmt);
     }
 
+    // ── The old character's name in the narrative text ────────────────────
+    // Only the columns that actually carry it, confirmed against a real database:
+    // events.event_data (the dialogue JSON), memories.content, memories.tags (slugs)
+    // and diary_entries.content.
+    //
+    // uuid_mappings.actor_name is left alone on purpose. It is the label SkyrimNet
+    // hashes an entity's identity from, so rewriting it changes what the resolver
+    // thinks the row is about - a different problem from making the prose read right,
+    // and one that would silently re-key memories.
+    if (!options.renameFrom.empty() && options.renameFrom != options.renameTo &&
+        !options.renameTo.empty()) {
+        // A one- or two-character name matches inside ordinary words, and there is no
+        // word-boundary operator in sqlite's REPLACE to prevent it. Rewriting 8000 rows
+        // of narrative into nonsense is far worse than leaving the old name in place.
+        if (options.renameFrom.size() < 3) {
+            if (reportLine) {
+                reportLine(Report::ReasonCode::kPartialByDesign,
+                           std::format("The old character name '{}' is too short to replace safely "
+                                       "- it would match inside ordinary words - so the SkyrimNet "
+                                       "text was left as it was.",
+                                       options.renameFrom));
+            }
+        } else {
+            const auto variants = NameVariants(options.renameFrom, options.renameTo);
+            struct TextColumn {
+                const char* table;
+                const char* column;
+                const char* description;
+            };
+            constexpr TextColumn kColumns[] = {
+                {"events", "event_data", "events"},
+                {"memories", "content", "memories"},
+                {"memories", "tags", "memory tags"},
+                {"diary_entries", "content", "diary entries"},
+            };
+            for (const auto& target : kColumns) {
+                const auto changed = RenameInColumn(db, target.table, target.column, variants);
+                result.rowsRenamed += changed;
+                if (changed > 0) {
+                    spdlog::info("SkyrimNetSideCar: renamed '{}' -> '{}' in {} {} row(s)",
+                                 options.renameFrom, options.renameTo, changed, target.description);
+                }
+            }
+            if (reportLine) {
+                reportLine(Report::ReasonCode::kNone,
+                           std::format("Replaced the old character name '{}' with '{}' in {} row(s) "
+                                       "of events, memories and diaries. A plain text replacement: "
+                                       "a longer name that contains the old one as a substring is "
+                                       "rewritten too.",
+                                       options.renameFrom, options.renameTo, result.rowsRenamed));
+            }
+        }
+    }
+
     // ── Orphan report for the four tables UUIDDriftConsolidator misses ────
     // Reported, never deleted: these hold authored content (diary text, songs,
     // screenshots) and losing it silently would be worse than leaving it dangling.
@@ -528,19 +722,42 @@ SkyrimNetSideCar::RestoreResult SkyrimNetSideCar::PrepareRestore(
         return result;
     }
 
-    // Also copy the prompt archive into place under the new id, so prompt history
-    // follows the memories.
-    const auto promptSource =
-        SnapshotPaths::SkyrimNetDir(snapshotDir) / "prompts_saves" / std::string(oldSaveId);
-    const auto promptTarget = PromptArchivePath(newSaveId);
-    uint64_t copied = 0;
-    Util::CopyDirectoryCapped(promptSource, promptTarget, 4ull * 1024 * 1024 * 1024, copied);
+    // The prompt archive - the dynamic bio updates and the save-specific character
+    // bios - under the new id, so prompt history follows the memories. Asked about
+    // separately because it is authored content the player may not want carried over,
+    // and because it is the one part that is written to a folder rather than staged.
+    if (options.copyPromptArchive) {
+        // The snapshot's copy is preferred; the old playthrough's live folder is the
+        // fallback for a snapshot whose size cap excluded the prompts.
+        auto promptSource = SnapshotPromptArchivePath(snapshotDir, oldSaveId);
+        if (!fs::is_directory(promptSource, ec) || fs::is_empty(promptSource, ec)) {
+            promptSource = PromptArchivePath(oldSaveId);
+        }
+        const auto promptTarget = PromptArchivePath(newSaveId);
+        if (fs::is_directory(promptSource, ec)) {
+            // Merges into an existing folder rather than replacing it: SkyrimNet may
+            // already have written a bio for this playthrough, and the requirement is
+            // to reuse the folder when it is there.
+            uint64_t copied = 0;
+            Util::CopyDirectoryCapped(promptSource, promptTarget, 4ull * 1024 * 1024 * 1024, copied);
+            result.promptBytesCopied = copied;
+            spdlog::info("SkyrimNetSideCar: copied {} prompt byte(s) from '{}' to '{}'", copied,
+                         Util::PathToUtf8String(promptSource),
+                         Util::PathToUtf8String(promptTarget));
+        } else if (reportLine) {
+            reportLine(Report::ReasonCode::kNone,
+                       "The prompt archive was requested but neither the snapshot nor the old "
+                       "playthrough's folder holds one, so there was nothing to copy.");
+        }
+    } else {
+        spdlog::info("SkyrimNetSideCar: prompt archive not copied (declined)");
+    }
 
     result.success = true;
-    spdlog::info("SkyrimNetSideCar: prepared '{}' - {} row(s) repaired, {} deleted, {} orphan "
-                 "group(s) reported, {} prompt bytes copied",
+    spdlog::info("SkyrimNetSideCar: prepared '{}' - {} row(s) repaired, {} deleted, {} renamed, "
+                 "{} orphan group(s) reported, {} prompt bytes copied",
                  Util::PathToUtf8String(pending), result.rowsRepaired, result.rowsDeleted,
-                 result.orphansReported, copied);
+                 result.rowsRenamed, result.orphansReported, result.promptBytesCopied);
     return result;
 }
 

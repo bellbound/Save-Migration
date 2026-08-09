@@ -28,7 +28,7 @@ constexpr std::string_view kKnownScripts[] = {
 
 constexpr std::string_view kKnownDlls[] = {
     Known::kDressUpDll, Known::kSkyrimNetDll, Known::kObodyDll, Known::kTngDll,
-    Known::kPapyrusUtilDll,
+    Known::kPapyrusUtilDll, Known::kVrEditorDll,
 };
 
 }  // namespace

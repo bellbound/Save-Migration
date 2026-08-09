@@ -26,6 +26,9 @@ public:
     [[nodiscard]] const Core::CategoryDescriptor& Describe() const override;
     void Collect(Core::CollectContext& ctx) override;
     void Apply(Core::ApplyContext& ctx) override;
+    /// `HasPerk` on every perk the snapshot recorded. Offset-immune, same as the
+    /// collector, so this stays honest even when the layout probe has failed.
+    void Validate(Core::ApplyContext& ctx) override;
 };
 
 }  // namespace SaveMigration::Categories

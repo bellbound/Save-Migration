@@ -23,8 +23,14 @@ public:
 
     /// Initialize with mod name. Must be called once at plugin load.
     /// Creates directory structure if needed.
-    /// @param modName - Name used for folder and INI file (e.g., "VRSexMenu")
-    void Initialize(std::string_view modName);
+    /// @param modName - Name used for the folder, and for the INI file unless
+    ///                  `fileName` overrides it (e.g., "VRSexMenu")
+    /// @param fileName - INI file name including extension. Empty keeps the
+    ///                  historical "<modName>_config.ini". Save Migration passes
+    ///                  "SaveMigration.ini" because the in-game prompts name that
+    ///                  file, and a prompt that names a file the user cannot find
+    ///                  is worse than no prompt.
+    void Initialize(std::string_view modName, std::string_view fileName = {});
 
     bool IsInitialized() const { return m_initialized; }
     const std::string& GetModName() const { return m_modName; }

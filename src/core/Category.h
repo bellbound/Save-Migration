@@ -113,6 +113,26 @@ struct CollectContext {
     nlohmann::json& ActorPayload(std::string_view categoryId, std::string_view actorKey);
 };
 
+/// One value that did not survive the import, found by reading it back.
+///
+/// A category is the only thing that knows what "landed correctly" means for its
+/// own payload, so validation lives with the applier rather than in a central
+/// checker that would have to re-derive every payload shape.
+struct ValidationIssue {
+    /// The category that found it, so the outcome classifier can decide whether
+    /// this makes the save unsafe without parsing any prose.
+    std::string categoryId;
+    /// What was checked, in the player's vocabulary: "Archery", "gold", "level".
+    std::string field;
+    /// Expected against found.
+    std::string detail;
+    /// True when the value is *definitively* wrong - read back, compared, and
+    /// different. False for a soft signal, where a legitimate game rule could
+    /// explain the difference. Only hard mismatches escalate an import to
+    /// "do not continue from this save".
+    bool hard = true;
+};
+
 /// Handed to appliers. Game thread only.
 struct ApplyContext {
     const Model::SnapshotDocument& doc;
@@ -135,6 +155,18 @@ struct ApplyContext {
             *continuationRequested = true;
         }
     }
+
+    // ── Validation pass only ──────────────────────────────────────────────
+    // Both are null during the apply pass, so a category cannot accidentally
+    // report a mismatch while it is still writing.
+
+    /// The id of the category currently running, set by the orchestrator.
+    std::string_view currentCategoryId;
+    std::vector<ValidationIssue>* validationIssues = nullptr;
+
+    /// Record a value that did not survive. Also written to the report, so the
+    /// text file and the in-game summary cannot disagree.
+    void ReportValidation(std::string_view field, std::string_view detail, bool hard = true) const;
 
     /// Payload for a category, or a null json if absent.
     [[nodiscard]] const nlohmann::json& Payload(std::string_view categoryId) const;
@@ -168,6 +200,15 @@ public:
     virtual void Collect(CollectContext& ctx) = 0;
     virtual void Apply(ApplyContext& ctx) = 0;
 
+    /// Read back what `Apply` wrote and report anything that did not stick.
+    ///
+    /// Runs once, after every phase has finished, so a value clobbered by a later
+    /// phase is caught rather than confirmed at the instant it was written.
+    /// Default is no-op: plenty of categories write into another mod's storage
+    /// and have no honest way to read it back, and a validator that guesses is
+    /// worse than none.
+    virtual void Validate(ApplyContext&) {}
+
     /// Upgrade an older payload in place. Return false when the version cannot
     /// be migrated; the category is then reported as failed rather than applied
     /// against a shape it does not understand.
@@ -200,6 +241,10 @@ public:
     virtual void BeginApply(ApplyContext&) {}
     virtual void ApplyActor(const Model::ActorSubject& subject, ApplyContext& ctx) = 0;
     virtual void EndApply(ApplyContext&) {}
+
+    /// See `IGlobalCategory::Validate`. Walks the roster the same way the apply
+    /// pass did, so a per-actor validator gets the same subjects in the same order.
+    virtual void ValidateActor(const Model::ActorSubject&, ApplyContext&) {}
 
     /// Replay from the deferred queue. Return true to retire the item, false to
     /// retry on the next trigger.

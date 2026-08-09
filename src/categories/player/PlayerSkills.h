@@ -23,6 +23,10 @@ public:
     [[nodiscard]] const Core::CategoryDescriptor& Describe() const override;
     void Collect(Core::CollectContext& ctx) override;
     void Apply(Core::ApplyContext& ctx) override;
+    /// Re-reads both stores at the end of the run. The mirror check inside
+    /// `Apply` only proves the two agreed at the instant of the write; this one
+    /// proves the recorded level is still there after every later phase.
+    void Validate(Core::ApplyContext& ctx) override;
 };
 
 }  // namespace SaveMigration::Categories

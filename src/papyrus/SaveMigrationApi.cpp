@@ -72,12 +72,13 @@ RE::BSFixedString StatusReport(RE::StaticFunctionTag*) {
 
     const auto text = std::format(
         "mode={} saveId={} smidFound={} reverted={} newGame={} applied={} declined={} "
-        "neverAsk={} pending={} vrLayout={}",
+        "askBeforeImport={} pending={} vrLayout={}",
         Config::MigrationConfig::IsSnapshotMode() ? "SNAPSHOT" : "RESTORE", identity.SaveId(),
         identity.WasFoundInCoSave(), identity.HasReverted(),
         state.HasFlag(Core::StateFlag::kSeenNewGame),
         state.HasFlag(Core::StateFlag::kRestoreApplied),
-        state.HasFlag(Core::StateFlag::kRestoreDeclined), Config::MigrationConfig::NeverAsk(),
+        state.HasFlag(Core::StateFlag::kRestoreDeclined),
+        Config::MigrationConfig::AskBeforeImport(),
         Defer::PendingWorkQueue::Get().Size(),
         Core::VRLayoutProbe::Get().IsLayoutTrusted() ? "trusted" : "SUSPECT");
 

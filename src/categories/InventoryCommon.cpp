@@ -187,6 +187,18 @@ bool InventoryCommon::ApplyChunk(RE::TESObjectREFR* container, const nlohmann::j
 
         const auto stack = Model::ItemStack::FromJson(entry);
         if (stack.formKey.empty() || stack.count <= 0) {
+            // Counted rather than merely stepped over. `Validate` reconciles
+            // added + failed + skipped against the recorded total and treats a
+            // shortfall as "the walk stopped before the end", so an entry that
+            // lands in none of the three buckets reads as a truncated import.
+            //
+            // Measured on Skyrim VR 1.4.15, 2026-08-09: this snapshot holds 8
+            // count-0 stacks (Iron Shield, Iron Sword, Long Bow and the like),
+            // and every one of them widened that gap. The restore itself was
+            // clean - there is nothing to add for a count of zero - but the
+            // import was still classified UNSAFE, which is the one verdict a
+            // player is meant to act on.
+            ++cursor.skipped;
             continue;
         }
 

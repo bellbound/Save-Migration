@@ -31,6 +31,7 @@ std::string_view ToString(ReasonCode code) {
         case ReasonCode::kIoError:                  return "io_error";
         case ReasonCode::kSchemaVersionUnsupported: return "schema_version_unsupported";
         case ReasonCode::kRuntimeLayoutSuspect:     return "runtime_layout_suspect";
+        case ReasonCode::kValidationMismatch:       return "validation_mismatch";
         case ReasonCode::kPartialByDesign:          return "partial_by_design";
     }
     return "unknown";
@@ -137,6 +138,10 @@ std::string_view HintFor(ReasonCode code) {
         case ReasonCode::kRuntimeLayoutSuspect:
             return "The VR player memory layout failed its startup probe, so offset-dependent "
                    "readers were disabled for safety. Report the plugin version and game build.";
+        case ReasonCode::kValidationMismatch:
+            return "The value was written and did not stick. Load the save from before the import "
+                   "and run it again; if it repeats, another mod is writing the same field after "
+                   "this one.";
         case ReasonCode::kPartialByDesign:
             return "This is expected: the remainder is not migratable by any means, not a defect.";
         case ReasonCode::kNone:

@@ -3,6 +3,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "core/SerializationHub.h"
@@ -82,13 +83,39 @@ public:
     /// engine and the engine can call back into the sinks.
     [[nodiscard]] std::vector<PendingItem> Items() const;
 
-    /// Replace the queue wholesale after a drain pass.
+    /// Install the result of a drain pass.
+    ///
+    /// `survivors` is what the drain decided to keep. `processed` names every
+    /// (categoryId, subjectFormKey) the drain reached, so anything an applier
+    /// enqueued *while the drain was running* is kept rather than silently
+    /// wiped - unless it is a re-queue of a key the drain just retired, which is
+    /// dropped because honouring it would put the item straight back with its
+    /// attempt counter reset and never terminate.
+    void CommitDrain(std::vector<PendingItem> survivors,
+                     const std::vector<std::pair<std::string, std::string>>& processed);
+
+    /// Replace the queue wholesale. Debug/administrative use only; a drain must
+    /// go through `CommitDrain`.
     void Replace(std::vector<PendingItem> items);
 
-    /// Subject keys the sinks should watch. Rebuilt only on queue mutation, so
-    /// `ProcessEvent` is one hash probe rather than a scan.
-    [[nodiscard]] std::unordered_set<std::string> WatchedSubjects() const;
-    [[nodiscard]] std::unordered_set<std::string> WatchedCells() const;
+    // ── Sink hot path ─────────────────────────────────────────────────────
+    // These are called from `ProcessEvent` for *every* reference that loads or
+    // attaches while the queue is non-empty, which in a 2000-mod load order is
+    // thousands of calls per cell transition. They must therefore probe the
+    // watch set in place. An earlier revision returned the set **by value** and
+    // called `.contains()` on the copy: one full copy of up to 512 heap-allocated
+    // strings per engine event, on the game thread. That is the difference
+    // between the documented "one hash lookup" and a visible VR stutter every
+    // time the player walks through a door.
+
+    /// True when at least one queued item names a subject / a cell. Lets a sink
+    /// skip building a FormKey - itself several `LookupForm` calls plus a string
+    /// allocation - when there is provably nothing to match it against.
+    [[nodiscard]] bool HasWatchedSubjects() const;
+    [[nodiscard]] bool HasWatchedCells() const;
+
+    [[nodiscard]] bool IsWatchedSubject(const std::string& key) const;
+    [[nodiscard]] bool IsWatchedCell(const std::string& key) const;
 
     void Clear();
 

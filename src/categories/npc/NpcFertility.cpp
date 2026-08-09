@@ -237,6 +237,28 @@ void NpcFertility::CollectActor(const Model::ActorSubject& subject, Core::Collec
             values[spec.property] = *value;
         }
     }
+    // A derived, human-readable restatement of what `LastConception` already
+    // says. Nothing reads these back - the restore writes the raw arrays - but
+    // the raw arrays are a wall of parallel floats, and "is this NPC pregnant?"
+    // is the one question anyone looks at this file to answer.
+    //
+    // The predicate is not a guess: `LastConception[index] > 0.0` is what every
+    // Fertility Mode script tests, from the widget to the birth handler, and
+    // `GetCurrentGameTime() - LastConception[index]` is how _JSW_BB_Storage
+    // itself computes the term.
+    if (const auto conception = values.find(kConceptionArray);
+        conception != values.end() && conception->is_number()) {
+        const float value = conception->get<float>();
+        payload["pregnant"] = value > 0.0f;
+        if (value > 0.0f) {
+            if (auto* calendar = RE::Calendar::GetSingleton()) {
+                payload["daysPregnant"] = calendar->GetCurrentGameTime() - value;
+            }
+        }
+    } else {
+        payload["pregnant"] = false;
+    }
+
     payload["values"] = std::move(values);
 
     // FatherRaceId holds a *runtime* race form ID, which is meaningless in another
@@ -462,6 +484,63 @@ void NpcFertility::ApplyActor(const Model::ActorSubject& subject, Core::ApplyCon
     ++m_written;
     ctx.report.Succeeded(subjectRef, itemId, subject.refKey, subject.displayName);
     (void)vars;
+}
+
+bool NpcFertility::ApplyDeferred(const Model::ActorSubject& subject, Core::ApplyContext& ctx) {
+    // This is the *only* place the queued faction rank is ever written.
+    //
+    // Without this override the base-class default runs `ApplyActor` again, and
+    // `ApplyActor` does not apply a rank - it enqueues one. So the replay
+    // re-queued the same item, reported success, and the recorded rank was never
+    // written at all. Worse, it made the category the one shape the drain has to
+    // defend against: an applier that re-queues its own key on every pass.
+    //
+    // It also has to resolve its own handles. A deferred item can be replayed in a
+    // session where `BeginApply` never ran - the queue lives in the co-save and
+    // outlives the restore that filled it - and `m_handles` is then default
+    // constructed, which made `ApplyActor` return at its first line and retire the
+    // item having done nothing and said nothing.
+    if (!subject.actor) {
+        return true;
+    }
+    if (!ResolveHandles(ctx.report)) {
+        return true;  // Fertility is not usable here; retrying will not change that
+    }
+    if (!m_handles.effectsFaction) {
+        return true;
+    }
+    if (Config::MigrationConfig::FertilityDryRun()) {
+        spdlog::info("NpcFertility: dry run, not re-asserting the effects faction rank for '{}'",
+                     subject.displayName);
+        return true;
+    }
+
+    const auto& payload = ctx.ActorPayload(kId, subject.refKey);
+    const int32_t factionRank = payload.value("effectsFactionRank", -1);
+    if (factionRank < 0) {
+        return true;
+    }
+
+    const Report::SubjectRef subjectRef{Report::SubjectKind::kActor, subject.refKey,
+                                        subject.displayName};
+    const auto itemId = std::format("{}/fertility_faction", subject.refKey);
+
+    // `AddToFaction` sets the rank on an existing membership as well as creating
+    // one, so it covers both the actor Fertility had already enrolled and the one
+    // it had not.
+    subject.actor->AddToFaction(m_handles.effectsFaction, static_cast<int8_t>(factionRank));
+
+    const auto landed = subject.actor->GetFactionRank(m_handles.effectsFaction, false);
+    if (landed == factionRank) {
+        ctx.report.Succeeded(subjectRef, itemId, subject.refKey,
+                             std::format("{} (effects faction rank {})", subject.displayName,
+                                         factionRank));
+    } else {
+        ctx.report.Failed(subjectRef, itemId, Report::ReasonCode::kValidationMismatch,
+                          std::format("wrote effects faction rank {} for '{}' but read back {}",
+                                      factionRank, subject.displayName, landed));
+    }
+    return true;
 }
 
 }  // namespace SaveMigration::Categories

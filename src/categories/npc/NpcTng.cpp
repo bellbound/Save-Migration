@@ -1,8 +1,11 @@
 #include "categories/npc/NpcTng.h"
 
+#include <charconv>
 #include <format>
 #include <mutex>
+#include <optional>
 #include <string>
+#include <vector>
 
 #include "defer/PendingWorkQueue.h"
 #include "model/FormRef.h"
@@ -46,6 +49,173 @@ void ResetPrimed() {
     g_primed.haveSize = false;
     g_primed.addonKey.clear();
     g_primed.size = 0;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Reading TNG without asking TNG.
+//
+// The Papyrus route above is TNG's public surface, and it is honest, but it is
+// also asynchronous: the harvest is one game-thread task, so a call dispatched
+// inside `Collect` cannot answer before `Collect` ends. That is what
+// `PrepareCollect` and iVmSettleDelayMs exist to work around, and it is a race
+// that the plugin loses whenever the VM is busy or suspended - a snapshot taken
+// on 2026-08-08 recorded `capturePending: true` and nothing else, which is
+// exactly the failure it is meant to prevent.
+//
+// It does not have to be a race. TNG keeps both values in ordinary game data
+// that any SKSE plugin can read on the spot:
+//
+//   - the addon index is a *keyword* on the actor's TESNPC, named
+//     "TNG_ActorAddnAuto:NN" or "TNG_ActorAddnUser:NN" (Core::OrganizeNPCKeywords),
+//     where NN indexes TNG's master addon list, and
+//   - the size category is one of five keywords, TheNewGentleman.esp 0xFE1..0xFE5
+//     (Util::sizeKeyIDs).
+//
+// The index is not portable on its own - it means a different addon in a
+// different install, which is why the payload has always stored a FormKey - but
+// resolving it *here* is straightforward, because TNG builds its master list by
+// walking the armour array in order and keeping everything carrying the
+// male/female addon keyword (Core::LoadAddons). The same walk in the same
+// session yields the same list.
+//
+// Both are synchronous reads of loaded forms, so there is nothing to wait for
+// and nothing to time out.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// TheNewGentleman.esp keyword ids, from `Common::Util::keyIDs` and
+/// `Common::Util::sizeKeyIDs`. Hard-coded because they are record ids in a
+/// specific file rather than anything derivable.
+constexpr std::string_view kTngPlugin = "TheNewGentleman.esp";
+constexpr RE::FormID kKeywordAddonMale = 0xFF9;
+constexpr RE::FormID kKeywordAddonFemale = 0xFFA;
+constexpr RE::FormID kKeywordSizeFirst = 0xFE1;
+constexpr int32_t kSizeCategoryCount = 5;
+
+constexpr std::string_view kAutoAddonPrefix = "TNG_ActorAddnAuto:";
+constexpr std::string_view kUserAddonPrefix = "TNG_ActorAddnUser:";
+
+struct NativeState {
+    bool haveAddon = false;
+    /// Empty with `haveAddon` set means "TNG tracks this actor and it has no
+    /// addon", which is a different answer from "we could not tell".
+    std::string addonKey;
+    int32_t addonIndex = -1;
+    bool userChosen = false;
+    bool haveSize = false;
+    int32_t size = 0;
+};
+
+RE::BGSKeyword* TngKeyword(RE::FormID localId) {
+    auto* handler = RE::TESDataHandler::GetSingleton();
+    if (!handler) {
+        return nullptr;
+    }
+    return handler->LookupForm<RE::BGSKeyword>(localId, kTngPlugin);
+}
+
+/// TNG's master addon list for one gender, rebuilt the way `Core::LoadAddons`
+/// builds it: the armour array in its own order, filtered by the addon keyword.
+const std::vector<RE::TESObjectARMO*>& AddonList(bool female) {
+    static std::vector<RE::TESObjectARMO*> male;
+    static std::vector<RE::TESObjectARMO*> fem;
+    static bool built = false;
+    if (!built) {
+        built = true;
+        auto* handler = RE::TESDataHandler::GetSingleton();
+        auto* maleKey = TngKeyword(kKeywordAddonMale);
+        auto* femKey = TngKeyword(kKeywordAddonFemale);
+        if (handler && (maleKey || femKey)) {
+            for (auto* armor : handler->GetFormArray<RE::TESObjectARMO>()) {
+                if (!armor) {
+                    continue;
+                }
+                if (maleKey && armor->HasKeyword(maleKey)) {
+                    male.push_back(armor);
+                }
+                if (femKey && armor->HasKeyword(femKey)) {
+                    fem.push_back(armor);
+                }
+            }
+        }
+        spdlog::info("NpcTng: rebuilt TNG's addon lists natively - {} male, {} female",
+                     male.size(), fem.size());
+    }
+    return female ? fem : male;
+}
+
+std::optional<int32_t> ParseAddonIndexFromKeywords(RE::TESNPC* npc, bool& userChosen) {
+    std::optional<int32_t> found;
+    bool user = false;
+    npc->ForEachKeyword([&](RE::BGSKeyword* keyword) {
+        const char* editorId = keyword ? keyword->GetFormEditorID() : nullptr;
+        if (!editorId) {
+            return RE::BSContainer::ForEachResult::kContinue;
+        }
+        const std::string_view text(editorId);
+        std::string_view digits;
+        if (text.starts_with(kAutoAddonPrefix)) {
+            digits = text.substr(kAutoAddonPrefix.size());
+        } else if (text.starts_with(kUserAddonPrefix)) {
+            digits = text.substr(kUserAddonPrefix.size());
+            user = true;
+        } else {
+            return RE::BSContainer::ForEachResult::kContinue;
+        }
+        // TNG writes it zero-padded to two digits; `from_chars` rather than
+        // `stoi` so a malformed keyword is a miss rather than an exception on
+        // the game thread.
+        int32_t value = 0;
+        const auto result =
+            std::from_chars(digits.data(), digits.data() + digits.size(), value);
+        if (result.ec == std::errc{}) {
+            found = value;
+            return RE::BSContainer::ForEachResult::kStop;
+        }
+        return RE::BSContainer::ForEachResult::kContinue;
+    });
+    userChosen = user;
+    return found;
+}
+
+NativeState ReadNativeState(RE::Actor* actor) {
+    NativeState state;
+    auto* npc = actor ? actor->GetActorBase() : nullptr;
+    if (!npc) {
+        return state;
+    }
+
+    // ── Size ──────────────────────────────────────────────────────────────
+    for (int32_t i = 0; i < kSizeCategoryCount; ++i) {
+        auto* keyword = TngKeyword(kKeywordSizeFirst + static_cast<RE::FormID>(i));
+        if (keyword && npc->HasKeyword(keyword)) {
+            state.haveSize = true;
+            state.size = i;
+            break;
+        }
+    }
+
+    // ── Addon ─────────────────────────────────────────────────────────────
+    const auto index = ParseAddonIndexFromKeywords(npc, state.userChosen);
+    if (!index) {
+        return state;
+    }
+    state.addonIndex = *index;
+    if (*index < 0) {
+        // TNG's own "no addon" sentinel. A real answer, so `haveAddon` is set
+        // with an empty key.
+        state.haveAddon = true;
+        return state;
+    }
+    const auto& list = AddonList(npc->IsFemale());
+    if (static_cast<size_t>(*index) >= list.size()) {
+        spdlog::warn("NpcTng: keyword names addon index {} but only {} are installed for this "
+                     "gender; leaving the addon uncaptured",
+                     *index, list.size());
+        return state;
+    }
+    state.haveAddon = true;
+    state.addonKey = Model::FormKeyUtil::BuildFormKey(list[static_cast<size_t>(*index)]);
+    return state;
 }
 
 }  // namespace
@@ -124,18 +294,53 @@ void NpcTng::CollectActor(const Model::ActorSubject& subject, Core::CollectConte
         size = g_primed.size;
     }
 
+    // The native read is the primary source; the VM answer is the cross-check.
+    // That is the way round it should always have been - the native read cannot
+    // time out - and having both is worth keeping, because a disagreement is the
+    // only evidence that would show the keyword-and-index reconstruction has
+    // drifted from what TNG itself would say.
+    const auto native = ReadNativeState(subject.actor);
+    payload["source"] = "keywords";
+
+    if (native.haveAddon || native.haveSize) {
+        if (haveAddon && native.haveAddon && addonKey != native.addonKey) {
+            spdlog::warn(
+                "NpcTng: the keyword read says addon '{}' (index {}) but TNG's own Papyrus call "
+                "says '{}'. Recording TNG's answer and keeping the keyword one alongside it.",
+                native.addonKey.empty() ? "(none)" : native.addonKey, native.addonIndex,
+                addonKey.empty() ? "(none)" : addonKey);
+            payload["addonFromKeywords"] = native.addonKey;
+            payload["source"] = "papyrus";
+        } else if (native.haveAddon) {
+            addonKey = native.addonKey;
+            haveAddon = true;
+        }
+        if (native.haveSize && !haveSize) {
+            size = native.size;
+            haveSize = true;
+        }
+        // Useful to the applier as a first guess, and it is only ever a guess -
+        // the applier still reads back and sweeps if the index landed wrong.
+        if (native.addonIndex >= 0) {
+            payload["addonIndex"] = native.addonIndex;
+        }
+        payload["addonChosenByUser"] = native.userChosen;
+    } else if (haveAddon || haveSize) {
+        payload["source"] = "papyrus";
+    }
+
     if (!haveAddon && !haveSize) {
-        // The VM never answered within the settle window. Record that honestly
-        // and fail the item, rather than writing zeros that a restore would
-        // dutifully apply.
+        // Neither route produced anything. With the keyword read in place this
+        // no longer means "the VM was busy" - it means TNG has never touched
+        // this actor, which for the player is a genuine "no addon".
         payload["capturePending"] = true;
         payload["note"] =
-            "TNG answers only through Papyrus and did not reply before the harvest. Raise "
-            "Snapshot:iVmSettleDelayMs, or check that the VM was running - a blocking menu "
-            "suspends it.";
+            "Neither TNG's keywords nor its Papyrus surface reported an addon or a size for this "
+            "actor. TNG most likely never processed it - check that the race is supported and that "
+            "TheNewGentleman.esp is active.";
         ctx.report.Failed(Report::PlayerSubject(), std::format("{}/tng", subject.refKey),
-                          Report::ReasonCode::kPapyrusTimeout,
-                          "TNG did not answer before the harvest; addon and size not recorded",
+                          Report::ReasonCode::kModApiMissing,
+                          "TNG reported no state for this actor; addon and size not recorded",
                           subject.refKey, "TNG player addon");
         return;
     }

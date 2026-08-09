@@ -18,6 +18,16 @@ public:
     [[nodiscard]] const Core::CategoryDescriptor& Describe() const override;
     void Collect(Core::CollectContext& ctx) override;
     void Apply(Core::ApplyContext& ctx) override;
+    /// Confirms the chunked apply reached the end of the list.
+    ///
+    /// Deliberately *not* a per-item inventory comparison: which items are
+    /// legitimately absent depends on `bRestoreQuestItems`, container ownership
+    /// and the missing-plugin set, and re-deriving all three here would be a
+    /// second copy of the policy that could disagree with the first. What the
+    /// chunking can actually get wrong is stopping early - the orchestrator's
+    /// runaway backstop abandons a phase that asks for too many continuations -
+    /// and that is what this checks.
+    void Validate(Core::ApplyContext& ctx) override;
 
 private:
     /// Survives across frames while a chunked apply is in progress.

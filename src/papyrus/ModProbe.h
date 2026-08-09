@@ -96,6 +96,7 @@ constexpr std::string_view kSkyrimNetDll = "SkyrimNet.dll";
 constexpr std::string_view kObodyDll = "OBody.dll";
 constexpr std::string_view kTngDll = "TheNewGentleman.dll";
 constexpr std::string_view kPapyrusUtilDll = "PapyrusUtil.dll";
+constexpr std::string_view kVrEditorDll = "VREditor.dll";
 }  // namespace Known
 
 }  // namespace SaveMigration::Papyrus

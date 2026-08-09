@@ -1,5 +1,6 @@
 #include "core/Category.h"
 
+#include <format>
 #include <string>
 
 #include "papyrus/ModProbe.h"
@@ -100,6 +101,22 @@ uint32_t ApplyContext::PayloadSchemaVersion(std::string_view categoryId) const {
         return 0;
     }
     return it->value("schemaVersion", 0u);
+}
+
+void ApplyContext::ReportValidation(std::string_view field, std::string_view detail,
+                                    bool hard) const {
+    if (!validationIssues) {
+        // Called outside the validation pass. A category writing during apply and
+        // reporting a mismatch in the same breath is a bug worth naming.
+        spdlog::error("ApplyContext: ReportValidation('{}') outside the validation pass", field);
+        return;
+    }
+    validationIssues->push_back(ValidationIssue{std::string(currentCategoryId), std::string(field),
+                                                std::string(detail), hard});
+    // The report gets the same line, so the text file and the in-game summary are
+    // two renderings of one set of facts rather than two independent accounts.
+    report.Warn(Report::ReasonCode::kValidationMismatch,
+                std::format("{}: {}", field, detail));
 }
 
 bool IGlobalCategory::IsAvailable() const {

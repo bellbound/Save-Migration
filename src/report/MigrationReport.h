@@ -56,6 +56,10 @@ enum class ReasonCode : uint8_t {
     kIoError,
     kSchemaVersionUnsupported,
     kRuntimeLayoutSuspect,
+    /// The value was written, and reading it back afterwards gave something
+    /// else. Distinct from a failed write: the apply pass believed it succeeded,
+    /// which means something later in the run - or another mod - overwrote it.
+    kValidationMismatch,
 
     /// First-class, not a bug: the thing is *correctly* incomplete. Visited-map
     /// statistics and vampirism state land here. Without this code a correct

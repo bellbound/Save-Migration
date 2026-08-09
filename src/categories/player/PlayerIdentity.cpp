@@ -96,4 +96,23 @@ void PlayerIdentity::Apply(Core::ApplyContext& ctx) {
     }
 }
 
+void PlayerIdentity::Validate(Core::ApplyContext& ctx) {
+    if (!Config::MigrationConfig::RestoreName()) {
+        return;
+    }
+    const auto recorded = ctx.Payload(kId).value("name", std::string{});
+    if (recorded.empty()) {
+        return;
+    }
+    auto* base = ctx.player ? ctx.player->GetActorBase() : nullptr;
+    const char* current = base ? base->GetFullName() : nullptr;
+    const std::string actual =
+        (current && *current) ? Util::ConvertSkyrimTextToUTF8(current) : std::string{};
+    if (actual == recorded) {
+        return;
+    }
+    ctx.ReportValidation("player name", std::format("expected '{}', found '{}'", recorded,
+                                                    actual.empty() ? "(none)" : actual));
+}
+
 }  // namespace SaveMigration::Categories

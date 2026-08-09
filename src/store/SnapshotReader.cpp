@@ -2,6 +2,7 @@
 
 #include <format>
 
+#include "config/MigrationConfig.h"
 #include "store/SnapshotPaths.h"
 #include "util/FileUtil.h"
 #include "util/StringUtil.h"
@@ -84,6 +85,14 @@ std::optional<SnapshotSummary> SnapshotReader::SelectNewest(std::string_view exc
         if (!excludeSaveId.empty() && Util::IEquals(summary.saveId, excludeSaveId)) {
             spdlog::debug("SnapshotReader: excluding snapshot from the current save line ({})",
                           summary.saveId);
+            continue;
+        }
+        // The directory name is the snapshot id everywhere else - the co-save
+        // breadcrumb, the restore receipt - so it is what the declined list
+        // holds too.
+        const auto snapshotId = Util::PathToUtf8String(summary.dir.filename());
+        if (Config::MigrationConfig::IsSnapshotDeclined(snapshotId)) {
+            spdlog::info("SnapshotReader: skipping '{}' - declined for good in the INI", snapshotId);
             continue;
         }
         if (!best || summary.takenAtUnixMs > best->takenAtUnixMs) {

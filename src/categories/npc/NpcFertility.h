@@ -44,6 +44,7 @@ public:
     void EndCollect(Core::CollectContext& ctx) override;
     void BeginApply(Core::ApplyContext& ctx) override;
     void ApplyActor(const Model::ActorSubject& subject, Core::ApplyContext& ctx) override;
+    bool ApplyDeferred(const Model::ActorSubject& subject, Core::ApplyContext& ctx) override;
 
 private:
     struct Handles {

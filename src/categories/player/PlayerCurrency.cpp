@@ -100,4 +100,26 @@ void PlayerCurrency::Apply(Core::ApplyContext& ctx) {
     }
 }
 
+void PlayerCurrency::Validate(Core::ApplyContext& ctx) {
+    const auto& payload = ctx.Payload(kId);
+    const auto goldEntry = payload.find("gold");
+    if (goldEntry == payload.end() || !goldEntry->is_number() || !ctx.player) {
+        return;
+    }
+    auto* gold = Model::WellKnownForms::Get().Gold();
+    if (!gold) {
+        return;  // Apply already reported the lookup failure
+    }
+
+    const auto target = goldEntry->get<int32_t>();
+    const auto actual = Util::CountInInventory(ctx.player, gold);
+    if (actual == target) {
+        return;
+    }
+    // Gold is written last thing in the economy phase and nothing later in the
+    // run spends it, so a difference is a genuinely failed write rather than
+    // normal play - hence hard.
+    ctx.ReportValidation("gold", std::format("expected {}, found {}", target, actual));
+}
+
 }  // namespace SaveMigration::Categories

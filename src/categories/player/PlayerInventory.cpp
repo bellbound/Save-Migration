@@ -90,4 +90,35 @@ void PlayerInventory::Apply(Core::ApplyContext& ctx) {
                                 (m_cursor.nextIndex + perFrame - 1) / std::max(perFrame, 1u)));
 }
 
+void PlayerInventory::Validate(Core::ApplyContext& ctx) {
+    const auto& payload = ctx.Payload(kId);
+    const auto items = payload.find("items");
+    if (items == payload.end() || !items->is_array()) {
+        return;
+    }
+
+    const auto recorded = items->size();
+    const auto reached =
+        static_cast<size_t>(m_cursor.added) + m_cursor.failed + m_cursor.skipped;
+    if (reached >= recorded) {
+        return;
+    }
+    // Every stack is in exactly one of the three buckets, so a shortfall means
+    // the walk stopped before the end of the list rather than that entries were
+    // rejected - those are counted in `failed`.
+    //
+    // Soft, deliberately. `hard` means "read back, compared, and definitively
+    // wrong", and this is not that: nothing is read back at all, it is a
+    // coverage check on our own bookkeeping. It also does not deserve the
+    // consequence a hard issue carries, which is telling the player not to keep
+    // playing the save. Items that did not arrive leave the character poorer,
+    // not incoherent - they can be handed back at the console, and everything
+    // else in the import still stands.
+    ctx.ReportValidation("inventory",
+                         std::format("{} of {} item stacks were never reached; those items are "
+                                     "missing, the rest of the import is unaffected",
+                                     recorded - reached, recorded),
+                         /*hard=*/false);
+}
+
 }  // namespace SaveMigration::Categories

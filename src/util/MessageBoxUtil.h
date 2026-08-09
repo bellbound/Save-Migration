@@ -27,4 +27,14 @@ namespace MessageBoxUtil
     // Display a Yes/No/Cancel confirmation box
     // callback receives: 0 = Yes, 1 = No, 2 = Cancel
     void ShowYesNoCancel(const std::string& bodyText, Callback callback);
+
+    // True while a message box - anyone's, not just ours - owns the screen.
+    //
+    // Worth checking before queueing: mods routinely raise a box in the first
+    // seconds after a load, and a box queued behind one is both invisible for as
+    // long as the other is up and stacked in front of whatever the player was
+    // actually answering. MessageBoxMenu also pauses the game, which suspends the
+    // Papyrus VM, so "a box is open" is equally the answer to "can I call into
+    // Papyrus right now".
+    bool IsAnyOpen();
 }

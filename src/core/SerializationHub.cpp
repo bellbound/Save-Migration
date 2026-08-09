@@ -1,8 +1,22 @@
 #include "core/SerializationHub.h"
 
 #include <algorithm>
+#include <atomic>
 
 namespace SaveMigration::Core {
+
+namespace {
+
+/// See `SerializationHub::SessionEpoch`. Starts at 1 so that a default-
+/// initialised `0` in someone's cached state can never accidentally compare
+/// equal to a real epoch.
+std::atomic<uint64_t> g_sessionEpoch{1};
+
+}  // namespace
+
+uint64_t SerializationHub::SessionEpoch() {
+    return g_sessionEpoch.load(std::memory_order_relaxed);
+}
 
 SerializationHub& SerializationHub::Get() {
     static SerializationHub instance;
@@ -94,6 +108,10 @@ void SerializationHub::OnLoad(SKSE::SerializationInterface* intfc) {
         seen.insert(type);
     }
 
+    // Set even when the file held nothing of ours: the question this answers is
+    // "did a savegame load happen", not "did it carry our records".
+    self.m_coSaveLoadRan = true;
+
     // PostLoad runs for *every* handler, present or not: absence is itself
     // information. A missing SMID means this save predates the plugin, which is
     // one half of the "new playthrough" detector.
@@ -104,6 +122,16 @@ void SerializationHub::OnLoad(SKSE::SerializationInterface* intfc) {
 
 void SerializationHub::OnRevert(SKSE::SerializationInterface*) {
     auto& self = Get();
+    // Cleared here rather than anywhere else because a revert is issued for both
+    // paths into a game - load and new game - and is therefore the only moment
+    // that reliably precedes both.
+    self.m_coSaveLoadRan = false;
+
+    // The same property makes it the right place to invalidate every raw engine
+    // pointer this plugin is holding: the world about to be torn down is the one
+    // those pointers were resolved against.
+    g_sessionEpoch.fetch_add(1, std::memory_order_relaxed);
+
     for (auto* handler : self.m_handlers) {
         handler->Revert();
     }

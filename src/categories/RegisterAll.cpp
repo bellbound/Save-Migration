@@ -15,6 +15,7 @@
 #include "categories/npc/FollowerRegroup.h"
 #include "categories/npc/NpcEquipment.h"
 #include "categories/npc/NpcFertility.h"
+#include "categories/npc/NpcFollowerSlavery.h"
 #include "categories/npc/NpcHomeMhiyh.h"
 #include "categories/npc/NpcHomeNff.h"
 #include "categories/npc/NpcInventory.h"
@@ -29,7 +30,9 @@
 #include "categories/npc/NpcWaitState.h"
 #include "categories/system/LoadOrderCategory.h"
 #include "categories/system/SkyrimNetSideCarCategory.h"
+#include "categories/system/VrEditorFilesCategory.h"
 #include "categories/world/ClearedLocations.h"
+#include "categories/world/StoredContainers.h"
 #include "core/CategoryRegistry.h"
 
 namespace SaveMigration::Categories {
@@ -85,6 +88,7 @@ void RegisterAllCategories() {
     // state on object-load, and OBody assigns a random preset the first time it
     // sees a body. Landing first turns both into a no-op re-find.
     registry.AddActor(std::make_unique<NpcFertility>());
+    registry.AddActor(std::make_unique<NpcFollowerSlavery>());
     registry.AddActor(std::make_unique<NpcObodyPreset>());
 
     // ── Phase kIntegrationsHomes (44) ─────────────────────────────────────
@@ -120,6 +124,7 @@ void RegisterAllCategories() {
     // travel to already reads as cleared by the time they can go there.
     registry.AddGlobal(std::make_unique<PlayerMapMarkers>());
     registry.AddGlobal(std::make_unique<ClearedLocations>());
+    registry.AddGlobal(std::make_unique<StoredContainers>());
 
     // ── Phase kTeleport ───────────────────────────────────────────────────
     // Equip while stationary in the start cell; a mid-teleport equip desyncs the
@@ -155,6 +160,9 @@ void RegisterAllCategories() {
     // A GameDaysPassed jump detonates every armed timer in the load order, so
     // nothing of ours may still be in flight.
     registry.AddGlobal(std::make_unique<SkyrimNetSideCarCategory>());
+    // Pure file copying, with nothing in the run reading it, so it sits with the
+    // other file work rather than earlier.
+    registry.AddGlobal(std::make_unique<VrEditorFilesCategory>());
     registry.AddGlobal(std::make_unique<GameClock>());
 
     registry.Freeze();

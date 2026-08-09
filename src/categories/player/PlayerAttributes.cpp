@@ -190,6 +190,36 @@ void PlayerLevel::Apply(Core::ApplyContext& ctx) {
         "music and queue one attribute prompt per level.");
 }
 
+void PlayerLevel::Validate(Core::ApplyContext& ctx) {
+    const auto& payload = ctx.Payload(kLevelId);
+    if (!payload.contains("level")) {
+        return;
+    }
+    auto* player = ctx.player;
+    if (!player) {
+        ctx.ReportValidation("level", "the player could not be read back");
+        return;
+    }
+
+    const auto wantedLevel = payload.value("level", 1u);
+    const auto actualLevel = player->GetLevel();
+    if (wantedLevel != 0 && wantedLevel <= 30000 && actualLevel != wantedLevel) {
+        ctx.ReportValidation("level", std::format("expected {}, found {}", wantedLevel,
+                                                  actualLevel));
+    }
+
+    // Perk points, on the other hand, move legitimately: perks applied after the
+    // level write can spend them. Reported as soft for exactly that reason -
+    // worth showing, never grounds for telling the player to go back.
+    const auto wantedPerks = std::clamp<int>(payload.value("perkCount", 0), 0, 127);
+    const int actualPerks = player->GetGameStatsData().perkCount;
+    if (actualPerks != wantedPerks) {
+        ctx.ReportValidation("perk points",
+                             std::format("expected {}, found {}", wantedPerks, actualPerks),
+                             /*hard=*/false);
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // PlayerAttributes
 // ═══════════════════════════════════════════════════════════════════════════

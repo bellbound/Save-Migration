@@ -5,7 +5,9 @@
 
 #include "config/MigrationConfig.h"
 #include "core/CategoryRegistry.h"
+#include "core/ImportOutcome.h"
 #include "core/MigrationState.h"
+#include "core/PromptGate.h"
 #include "core/SaveIdentity.h"
 #include "core/Worker.h"
 #include "defer/PendingWorkQueue.h"
@@ -18,6 +20,7 @@
 #include "util/ActorEnum.h"
 #include "util/FileUtil.h"
 #include "util/GameThread.h"
+#include "util/MessageBoxUtil.h"
 #include "util/StringUtil.h"
 
 namespace SaveMigration::Core {
@@ -98,6 +101,9 @@ void RestoreOrchestrator::Begin(const std::filesystem::path& snapshotDir) {
             Model::FormResolver::Get().SetMissingPlugins(state->missingPlugins);
             Model::FormResolver::Get().SetAliases(Config::MigrationConfig::PluginAliases());
 
+            // Stamped in the same frame the roster is resolved, so the two can
+            // never disagree about which world these pointers belong to.
+            state->epoch = SerializationHub::SessionEpoch();
             state->subjects = Util::ActorEnum::BuildForApply(state->doc.roster);
             state->phases = CategoryRegistry::Get().PhasesInOrder();
             state->phaseIndex = 0;
@@ -107,11 +113,76 @@ void RestoreOrchestrator::Begin(const std::filesystem::path& snapshotDir) {
     });
 }
 
-void RestoreOrchestrator::ApplyPhase(std::shared_ptr<RunState> state) {
-    if (state->phaseIndex >= state->phases.size()) {
-        Finish(state);
+bool RestoreOrchestrator::AbandonIfWorldChanged(const std::shared_ptr<RunState>& state,
+                                                std::string_view where) {
+    if (state->epoch == SerializationHub::SessionEpoch()) {
+        return false;
+    }
+
+    // A load or a new game happened while the chain was mid-flight. Every
+    // `RE::Actor*` in `state->subjects` now points at a destroyed reference, and
+    // the phase about to run would walk all of them. There is no recovering the
+    // run - the world it was writing into is gone - so it stops here.
+    spdlog::error("RestoreOrchestrator: the game was reloaded during the import (at {}); abandoning "
+                  "the run rather than writing into a world it was not resolved against",
+                  where);
+
+    // Not marked as applied. The half-written save was discarded by the very
+    // load that interrupted us, and the save the player has now is either
+    // untouched or is the one they chose - either way it deserves to be offered
+    // the import again rather than silently written off.
+    state->subjects.clear();
+    state->phaseIndex = state->phases.size();
+    MigrationState::Get().ClearFlag(StateFlag::kRestoreInProgress);
+    m_lastRun.reset();
+    m_running.store(false);
+
+    RE::DebugNotification("Save Migration: import stopped - the game was reloaded.");
+    return true;
+}
+
+void RestoreOrchestrator::MaybeNotifyProgress(RunState& state, float fraction,
+                                              std::string_view stage) {
+    const auto now = std::chrono::steady_clock::now();
+    const auto intervalSec = Config::MigrationConfig::ProgressNotifyIntervalSec();
+    if (state.lastNotifyAt != std::chrono::steady_clock::time_point{} &&
+        now - state.lastNotifyAt < std::chrono::seconds(intervalSec)) {
         return;
     }
+    state.lastNotifyAt = now;
+
+    // DebugNotification truncates past roughly 64 characters, and a truncated
+    // percentage is worse than no percentage - so the text is built to fit.
+    const auto percent = std::clamp(static_cast<int>(fraction * 100.0f), 0, 100);
+    const auto text = std::format("Save Migration: {} {}%", stage, percent);
+    RE::DebugNotification(text.c_str());
+    spdlog::debug("RestoreOrchestrator: progress {}", text);
+}
+
+void RestoreOrchestrator::ApplyPhase(std::shared_ptr<RunState> state) {
+    if (AbandonIfWorldChanged(state, "the apply pass")) {
+        return;
+    }
+    if (state->phaseIndex >= state->phases.size()) {
+        // Phases done. Validation is a separate pass rather than a per-phase
+        // check because a value can be written correctly in phase 20 and
+        // clobbered in phase 80; checking at the moment of the write would
+        // confirm exactly the mistakes that matter least.
+        if (Config::MigrationConfig::ValidateAfterImport()) {
+            state->validateIndex = 0;
+            Util::OnGameThread([this, state]() { ValidateStep(state); });
+        } else {
+            Finish(state);
+        }
+        return;
+    }
+
+    // Phases are the honest denominator: the run is chained one per frame, and
+    // continuations inside a phase are bounded but not countable in advance.
+    MaybeNotifyProgress(*state,
+                        static_cast<float>(state->phaseIndex) /
+                            static_cast<float>(std::max<size_t>(1, state->phases.size())),
+                        "importing");
 
     const auto phase = state->phases[state->phaseIndex];
     auto& registry = CategoryRegistry::Get();
@@ -131,8 +202,21 @@ void RestoreOrchestrator::ApplyPhase(std::shared_ptr<RunState> state) {
         const auto& descriptor = entry.Describe();
         state->sink->BeginCategory(descriptor.id, descriptor.displayName, PhaseValue(phase));
 
+        // The sink is the report, not the log, so a category that hangs or takes
+        // the process down leaves nothing behind saying which one it was. These
+        // two lines are the only record of that, and the log flushes on every
+        // line, so the last one written is genuinely the last one reached.
+        spdlog::debug("RestoreOrchestrator: phase {} -> '{}'", PhaseValue(phase), descriptor.id);
+
         if (registry.IsDisabled(descriptor.id)) {
             state->sink->SkipCategory(Report::ReasonCode::kSkippedByIni, "disabled in the INI");
+        } else if (!Config::MigrationConfig::IsImportEnabled(descriptor.id)) {
+            // `[Imports]` is the import-direction switch. The data is still in
+            // the snapshot, so turning it back on and re-importing later works.
+            state->sink->SkipCategory(
+                Report::ReasonCode::kSkippedByIni,
+                std::format("switched off in [Imports] ({}=0)",
+                            Config::MigrationConfig::ImportKeyFor(descriptor.id)));
         } else if (!entry.IsAvailable()) {
             state->sink->SkipCategory(
                 Report::ReasonCode::kModNotInstalled,
@@ -163,6 +247,8 @@ void RestoreOrchestrator::ApplyPhase(std::shared_ptr<RunState> state) {
                                           std::format("applier threw: {}", e.what()));
             }
         }
+        spdlog::debug("RestoreOrchestrator: phase {} <- '{}' done", PhaseValue(phase),
+                      descriptor.id);
         state->sink->EndCategory();
     }
 
@@ -189,6 +275,71 @@ void RestoreOrchestrator::ApplyPhase(std::shared_ptr<RunState> state) {
     Util::OnGameThread([this, state]() { ApplyPhase(state); });
 }
 
+void RestoreOrchestrator::ValidateStep(std::shared_ptr<RunState> state) {
+    if (AbandonIfWorldChanged(state, "the validation pass")) {
+        return;
+    }
+    auto& registry = CategoryRegistry::Get();
+    const auto& ordered = registry.Ordered();
+
+    if (state->validateIndex >= ordered.size()) {
+        spdlog::info("RestoreOrchestrator: validation found {} issue(s)",
+                     state->validationIssues.size());
+        Finish(state);
+        return;
+    }
+
+    MaybeNotifyProgress(*state,
+                        static_cast<float>(state->validateIndex) /
+                            static_cast<float>(std::max<size_t>(1, ordered.size())),
+                        "checking");
+
+    const auto& entry = ordered[state->validateIndex];
+    const auto& descriptor = entry.Describe();
+
+    // Only categories that actually ran are worth reading back. A skipped one has
+    // nothing to check, and reporting a mismatch against a value nobody wrote
+    // would turn every deliberate opt-out into an alarming line in the summary.
+    const bool ran = !registry.IsDisabled(descriptor.id) &&
+                     Config::MigrationConfig::IsImportEnabled(descriptor.id) &&
+                     entry.IsAvailable();
+
+    if (ran) {
+        auto& pending = Defer::PendingWorkQueue::Get();
+        auto* player = RE::PlayerCharacter::GetSingleton();
+        bool continuation = false;
+        ApplyContext ctx{state->doc,   *state->sink, pending,     state->missingPlugins,
+                         &state->subjects, player,   &continuation};
+        ctx.currentCategoryId = descriptor.id;
+        ctx.validationIssues = &state->validationIssues;
+
+        // A separate rollup id from the apply pass: `ReportSink::BeginCategory`
+        // appends, and its forced-status set is keyed by id, so re-opening the
+        // same id would let an apply-time skip suppress the validation status.
+        state->sink->BeginCategory(std::string(descriptor.id) + "#validate",
+                                   std::string(descriptor.displayName) + " (check)",
+                                   PhaseValue(descriptor.phase));
+        try {
+            if (entry.global) {
+                entry.global->Validate(ctx);
+            } else {
+                entry.actor->ValidateActor(Util::ActorEnum::PlayerSubject(), ctx);
+                for (const auto& subject : state->subjects) {
+                    entry.actor->ValidateActor(subject, ctx);
+                }
+            }
+        } catch (const std::exception& e) {
+            // A throwing validator must never be able to condemn a good import.
+            state->sink->Warn(Report::ReasonCode::kIoError,
+                              std::format("validator threw: {}", e.what()));
+        }
+        state->sink->EndCategory();
+    }
+
+    ++state->validateIndex;
+    Util::OnGameThread([this, state]() { ValidateStep(state); });
+}
+
 void RestoreOrchestrator::Finish(std::shared_ptr<RunState> state) {
     auto& pending = Defer::PendingWorkQueue::Get();
     const auto deferredCount = pending.Size();
@@ -200,13 +351,40 @@ void RestoreOrchestrator::Finish(std::shared_ptr<RunState> state) {
     // alone.
     Config::MigrationConfig::SetLastRestoreBreadcrumb(state->snapshotDir.filename().string());
 
+    // The restore is over, so the flag that suppresses snapshotting a
+    // half-restored world has to come off - otherwise switching back to export
+    // mode on this save line would refuse every harvest for ever.
+    MigrationState::Get().ClearFlag(StateFlag::kRestoreInProgress);
+
     spdlog::info("RestoreOrchestrator: restore complete, {} item(s) deferred", deferredCount);
 
     auto report = state->sink->Finish();
     const auto snapshotDir = state->snapshotDir;
     const auto saveId = SaveIdentity::Get().SaveId();
 
-    Worker::Get().Post("restore-report", [this, report, snapshotDir, saveId, deferredCount]() {
+    // ── What the player is told ───────────────────────────────────────────
+    const auto outcome =
+        ClassifyImport(report, state->validationIssues, static_cast<uint32_t>(deferredCount));
+    if (outcome.IsUnsafe()) {
+        spdlog::error("RestoreOrchestrator: import is UNSAFE - {} critical failure(s), {} value(s) "
+                      "did not stick",
+                      outcome.criticalFailures.size(), outcome.hardValidationIssues.size());
+    }
+    // The notification lands immediately; the box waits for a clear screen,
+    // because a restore can finish while a loading screen or another mod's
+    // prompt is still up and a box queued then is never seen.
+    RE::DebugNotification(outcome.NotificationText().c_str());
+    PromptGate::Arm("import-outcome", [text = outcome.AlertText()]() {
+        MessageBoxUtil::ShowOK(text);
+    });
+
+    // Cleared here, not in the worker task below. `Worker::Post` drops silently
+    // during shutdown, and a dropped task used to leave `m_running` true for the
+    // rest of the session - which `ShouldOfferRestore` reads as "a restore is
+    // already running" and refuses every subsequent offer.
+    m_running.store(false);
+
+    Worker::Get().Post("restore-report", [report, snapshotDir, saveId, deferredCount]() {
         const auto rendered = Report::ReportWriter::Render(report);
         Report::ReportWriter::Write(report, rendered);
 
@@ -223,19 +401,12 @@ void RestoreOrchestrator::Finish(std::shared_ptr<RunState> state) {
         };
         Util::WriteFileAtomic(Store::SnapshotPaths::RestoreReceipt(snapshotDir),
                               Util::SafeDump(receipt, 2));
-
-        m_running.store(false);
     });
 
-    if (report.requiresReload) {
-        RE::DebugNotification("Save Migration: save and reload once to finish the SkyrimNet step.");
-    }
-    if (deferredCount > 0) {
-        RE::DebugNotification(
-            std::format("Save Migration: {} item(s) will apply as you meet those NPCs.",
-                        deferredCount)
-                .c_str());
-    }
+    // The reload requirement and the deferred count used to be two more
+    // notifications here. They are both in the message box now: three
+    // notifications fired in the same frame overwrite each other, so the player
+    // saw the last one and nothing else.
 }
 
 void RestoreOrchestrator::RunDeferredPass() {
