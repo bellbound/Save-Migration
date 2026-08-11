@@ -98,15 +98,17 @@ void CategoryRegistry::Freeze() {
         spdlog::info("CategoryRegistry: category '{}' disabled by INI", id);
     }
 
-    // `[Imports]` can only be populated here: this is the first moment the full
-    // category list exists. Registration is in `m_ordered` order, so the section
-    // reads down the INI in the order the import actually applies things.
-    std::vector<std::string> importIds;
-    importIds.reserve(m_ordered.size());
+    // `[Imports]` and `[Exports]` can only be populated here: this is the first
+    // moment the full category list exists. Registration is in `m_ordered` order,
+    // so both sections read down the INI in the order the run actually applies
+    // things.
+    std::vector<std::string> categoryIds;
+    categoryIds.reserve(m_ordered.size());
     for (const auto& entry : m_ordered) {
-        importIds.emplace_back(entry.Describe().id);
+        categoryIds.emplace_back(entry.Describe().id);
     }
-    Config::MigrationConfig::RegisterImportToggles(importIds);
+    Config::MigrationConfig::RegisterImportToggles(categoryIds);
+    Config::MigrationConfig::RegisterExportToggles(categoryIds);
 
     m_frozen = true;
     spdlog::info("CategoryRegistry: frozen with {} global + {} per-actor categories",

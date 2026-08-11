@@ -45,6 +45,10 @@ std::string Trim(std::string_view text);
 /// comma-separated INI list options (sDisabledCategories, sPluginAliases).
 std::vector<std::string> SplitAndTrim(std::string_view text, char delim = ',');
 
+/// The inverse, for report prose: `a, b, c`. No trailing separator, and an empty
+/// list yields an empty string rather than a lone separator.
+std::string JoinStrings(const std::vector<std::string>& parts, std::string_view separator);
+
 /// Case-insensitive equality for plugin names, script names and editor IDs —
 /// all of which the engine treats case-insensitively.
 bool IEquals(std::string_view a, std::string_view b);

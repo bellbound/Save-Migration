@@ -380,8 +380,8 @@ void RestoreOrchestrator::Finish(std::shared_ptr<RunState> state) {
 
     // Cleared here, not in the worker task below. `Worker::Post` drops silently
     // during shutdown, and a dropped task used to leave `m_running` true for the
-    // rest of the session - which `ShouldOfferRestore` reads as "a restore is
-    // already running" and refuses every subsequent offer.
+    // rest of the session - which every caller reads as "a restore is already
+    // running" and refuses every subsequent import for.
     m_running.store(false);
 
     Worker::Get().Post("restore-report", [report, snapshotDir, saveId, deferredCount]() {

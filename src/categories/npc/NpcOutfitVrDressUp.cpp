@@ -37,20 +37,41 @@ DressUp::Interface002* GetDressUpApi() {
         spdlog::warn("NpcOutfitVrDressUp: DressUpVR.dll has no GetDressUpInterface export");
         return nullptr;
     }
-    cached = static_cast<DressUp::Interface002*>(fn(2));
-    if (!cached) {
+    auto* candidate = static_cast<DressUp::Interface002*>(fn(DressUp::DRESSUP_INTERFACE_VERSION_002));
+    if (!candidate) {
         spdlog::warn(
             "NpcOutfitVrDressUp: DressUpVR.dll is present but does not provide interface v2. "
             "Outfits cannot be enumerated or injected without it - update VR Dress Up.");
         return nullptr;
     }
-    spdlog::info("NpcOutfitVrDressUp: DressUp interface v{} build {}", cached->GetVersion(),
-                 cached->GetBuild());
+
+    // Every other call here is a virtual dispatch through this pointer, so the
+    // vtable layout has to be the one this header describes. GetVersion is slot 0
+    // in both v001 and v002 and is the only handshake available: if a future
+    // DressUpVR hands back some other interface for request 2, this is what catches
+    // it, and the alternative is calling EnumerateOutfits through the wrong slot.
+    const auto version = candidate->GetVersion();
+    if (version != DressUp::DRESSUP_INTERFACE_VERSION_002) {
+        spdlog::warn(
+            "NpcOutfitVrDressUp: asked DressUpVR.dll for interface v{} and got v{} back. The "
+            "vtable is not the one this build was compiled against, so no call is safe to make - "
+            "VR Dress Up outfits will be skipped.",
+            DressUp::DRESSUP_INTERFACE_VERSION_002, version);
+        return nullptr;
+    }
+
+    cached = candidate;
+    spdlog::info("NpcOutfitVrDressUp: DressUp interface v{} build {}", version, cached->GetBuild());
     return cached;
 }
 
 std::vector<std::string> ToVector(const DressUp::StringList& list) {
     std::vector<std::string> result;
+    // count without items is a malformed answer, not an empty one. Trusting the
+    // count alone would walk a null pointer.
+    if (!list.items || list.count == 0) {
+        return result;
+    }
     result.reserve(list.count);
     for (uint32_t i = 0; i < list.count; ++i) {
         if (list.items[i]) {
@@ -118,7 +139,13 @@ void NpcOutfitVrDressUp::CollectActor(const Model::ActorSubject& subject,
 
     auto& payload = ctx.ActorPayload(kId, subject.refKey);
     payload["outfits"] = std::move(outfits);
-    payload["playerGiven"] = ToVector(api->EnumeratePlayerGivenItems(subject.actor));
+    // Absent rather than empty. The applier looks the key up and checks
+    // `is_array()`, so an actor the player has handed nothing simply has no
+    // `playerGiven` block.
+    if (auto playerGiven = ToVector(api->EnumeratePlayerGivenItems(subject.actor));
+        !playerGiven.empty()) {
+        payload["playerGiven"] = std::move(playerGiven);
+    }
     payload["wasLocked"] = api->IsActorLocked(subject.actor);
 
     ctx.report.Succeeded(

@@ -15,6 +15,7 @@
 #include "report/ReportSink.h"
 #include "report/ReportWriter.h"
 #include "store/LoadOrderFingerprint.h"
+#include "store/SnapshotLibrary.h"
 #include "store/SnapshotPaths.h"
 #include "store/SnapshotWriter.h"
 #include "util/ActorEnum.h"
@@ -24,6 +25,17 @@
 namespace SaveMigration::Core {
 
 namespace {
+
+/// This build's version, from `PROJECT_VERSION` in CMakeLists.txt.
+///
+/// Guarded so the file still compiles if it is ever built outside that project -
+/// an unknown version in the manifest is a smaller problem than a build failure,
+/// and it is still more honest than the empty string this field used to carry.
+#ifdef SAVEMIGRATION_VERSION
+constexpr std::string_view kPluginVersion = SAVEMIGRATION_VERSION;
+#else
+constexpr std::string_view kPluginVersion = "unknown";
+#endif
 
 int64_t NowUnixMs() {
     const auto now = std::chrono::system_clock::now().time_since_epoch();
@@ -56,10 +68,10 @@ void SnapshotOrchestrator::SetCompletionHandler(
 }
 
 bool SnapshotOrchestrator::ShouldTake(std::string& reasonOut) {
-    if (!Config::MigrationConfig::IsSnapshotMode()) {
-        reasonOut = "bSnapshot=0";
-        return false;
-    }
+    // Deliberately no `bAutoExportOnSave` check. This answers "is the world in a
+    // state worth snapshotting", which is true or false regardless of who is
+    // asking; whether an automatic harvest is wanted at all is the caller's
+    // business, and the menu's export button must not be gated on it.
     if (SaveIdentity::Get().SaveId().empty()) {
         reasonOut = "no save id yet";
         return false;
@@ -112,17 +124,54 @@ bool SnapshotOrchestrator::ShouldTake(std::string& reasonOut) {
     return true;
 }
 
+void SnapshotOrchestrator::MarkNextAsAutomatic() { m_nextIsAutomatic.store(true); }
+
 void SnapshotOrchestrator::Take(std::string_view savePath) {
+    // Both consumed before the refusal below, not after: a request that is turned
+    // away must not leave a flag set for whoever asks next, which would silently
+    // rob the following export of its VM wait or mark a hand-made snapshot as
+    // automatic and therefore deletable.
+    const bool skipWait = m_skipVmWait.exchange(false);
+    const bool automatic = m_nextIsAutomatic.exchange(false);
+
     bool expected = false;
     if (!m_inFlight.compare_exchange_strong(expected, true)) {
-        spdlog::warn("SnapshotOrchestrator: Take() while already in flight");
+        // Reported, not just logged, and without clearing `m_inFlight` - the
+        // harvest already running owns that flag and will clear it itself.
+        ReportFailure("a snapshot is already in flight", automatic);
         return;
     }
-    Util::OnGameThread([this, path = std::string(savePath)]() mutable {
+    Util::OnGameThread([this, skipWait, automatic, path = std::string(savePath)]() mutable {
+        m_automatic = automatic;
         m_harvestStarted = false;
         m_probeOutstanding.reset();
         m_vmWaitNote.clear();
+        if (skipWait) {
+            // The caller was a Papyrus native, so the VM answered by making the
+            // call. Waiting for `Utility.IsInMenuMode` to return false would mean
+            // waiting for the player to close the menu they pressed the button in.
+            OnVmReady(std::move(path), "requested through Papyrus - the VM is answering");
+            return;
+        }
         AwaitVm(std::move(path), 0);
+    });
+}
+
+void SnapshotOrchestrator::ReportFailure(std::string error, bool automatic) {
+    spdlog::error("SnapshotOrchestrator: harvest abandoned - {}", error);
+    // Same shape as the success path in `RunHarvest`: on the game thread, and the
+    // handler cleared as it fires so a later harvest cannot inherit a stale one.
+    Util::OnGameThread([this, automatic, error = std::move(error)]() {
+        if (!m_onComplete) {
+            return;
+        }
+        auto handler = std::move(m_onComplete);
+        m_onComplete = nullptr;
+        CompletionInfo info;
+        info.success = false;
+        info.error = error;
+        info.automatic = automatic;
+        handler(info);
     });
 }
 
@@ -208,17 +257,32 @@ void SnapshotOrchestrator::OnVmReady(std::string savePath, std::string_view deta
     // Collect instead gets its answer after the document is already serialised.
     auto* player = RE::PlayerCharacter::GetSingleton();
     auto& registry = CategoryRegistry::Get();
+
+    // A roster built for priming only, so a per-actor category can dispatch one
+    // read per actor and have the answers land during the settle delay. The
+    // harvest still builds its own below, which is what keeps the recorded roster
+    // a description of one instant; this one is a few seconds older by
+    // construction and callers are told so.
+    //
+    // The extra sources are read but deliberately not consumed - `RunHarvest`
+    // still needs them.
+    const auto primeRoster = Util::ActorEnum::BuildForCollect(m_pendingExtraSources);
+
     uint32_t primed = 0;
     for (const auto& entry : registry.Ordered()) {
         const auto& descriptor = entry.Describe();
-        if (registry.IsDisabled(descriptor.id) || !entry.IsAvailable()) {
+        // The export switch is consulted here as well as in the harvest, so a
+        // category the player has switched off does not spend VM round-trips
+        // priming for a collect that will not run.
+        if (registry.IsDisabled(descriptor.id) || !entry.IsAvailable() ||
+            !Config::MigrationConfig::IsExportEnabled(descriptor.id)) {
             continue;
         }
         try {
             if (entry.global) {
                 entry.global->PrepareCollect(player);
             } else {
-                entry.actor->PrepareCollect(player);
+                entry.actor->PrepareCollect(player, primeRoster);
             }
             ++primed;
         } catch (const std::exception& e) {
@@ -247,9 +311,16 @@ void SnapshotOrchestrator::ContributeRosterSource(Util::ActorEnum::ExtraSource s
 }
 
 void SnapshotOrchestrator::ForceTake(std::string_view savePath) {
-    spdlog::warn("SnapshotOrchestrator: forced snapshot (gates bypassed)");
+    spdlog::warn("SnapshotOrchestrator: forced snapshot (gates and VM wait bypassed)");
+    // Cleared, not left to `Take`. `ForceTake` is only ever reached because
+    // somebody asked for a snapshot by name, so it must never inherit an
+    // automatic marking from a request that was set up and then never ran - which
+    // would mark a hand-made snapshot deletable by the pruner.
+    m_nextIsAutomatic.store(false);
     m_lastStateKey.clear();
     m_lastSnapshotUnixMs = 0;
+    // Both callers are Papyrus natives - see the note on the declaration.
+    m_skipVmWait.store(true);
     Take(savePath);
 }
 
@@ -259,15 +330,29 @@ void SnapshotOrchestrator::RunHarvest(std::string savePath) {
     auto doc = std::make_shared<Model::SnapshotDocument>();
     auto sink = std::make_shared<Report::ReportSink>();
 
+    // Re-checked here rather than only in `ShouldTake`, because `ForceTake`
+    // bypasses that and the wait between the request and this point is long
+    // enough for a restore to have started - the MCM's own flow arms an import
+    // and applies it on menu close, which can land inside an export's settle
+    // delay. Harvesting a half-restored world would record a state that never
+    // existed.
+    if (MigrationState::Get().HasFlag(StateFlag::kRestoreInProgress)) {
+        m_inFlight.store(false);
+        ReportFailure("a restore started before the harvest could run", m_automatic);
+        return;
+    }
+
     auto* player = RE::PlayerCharacter::GetSingleton();
     if (!player) {
-        spdlog::error("SnapshotOrchestrator: no player at harvest time");
         m_inFlight.store(false);
+        ReportFailure("no player at harvest time", m_automatic);
         return;
     }
 
     // ── Manifest fields ───────────────────────────────────────────────────
     doc->manifestSchemaVersion = Model::kManifestSchemaVersion;
+    doc->pluginVersion = kPluginVersion;
+    doc->automatic = m_automatic ? 1u : 0u;
     doc->takenAtUnixMs = NowUnixMs();
     doc->saveId = SaveIdentity::Get().SaveId();
     doc->savePath = savePath;
@@ -287,6 +372,15 @@ void SnapshotOrchestrator::RunHarvest(std::string savePath) {
     } else {
         doc->characterName = "Unnamed";
     }
+
+    // Fixed here, before a single collector runs, because the side-car categories
+    // read it out of `ctx.doc` to decide where to copy hundreds of megabytes. It
+    // needs `characterName` and `takenAtUnixMs`, which is why it cannot be earlier.
+    doc->snapshotDir =
+        m_automatic
+            ? Store::SnapshotPaths::AutoSnapshotDir(doc->saveId, doc->characterName,
+                                                    doc->takenAtUnixMs)
+            : Store::SnapshotPaths::SnapshotDir(doc->saveId, doc->characterName);
 
     auto& fingerprint = Store::LoadOrderFingerprint::Get();
     if (!fingerprint.IsCaptured()) {
@@ -318,6 +412,12 @@ void SnapshotOrchestrator::RunHarvest(std::string savePath) {
 
         if (registry.IsDisabled(descriptor.id)) {
             sink->SkipCategory(Report::ReasonCode::kSkippedByIni, "disabled in the INI");
+        } else if (!Config::MigrationConfig::IsExportEnabled(descriptor.id)) {
+            // The What to Export page. Separate from `sDisabledCategories` above
+            // because it is one direction only: a category switched off here can
+            // still be imported from an older snapshot that has it.
+            sink->SkipCategory(Report::ReasonCode::kSkippedByIni,
+                               "switched off on the What to Export page");
         } else if (!entry.IsAvailable()) {
             sink->SkipCategory(
                 Report::ReasonCode::kModNotInstalled,
@@ -354,10 +454,25 @@ void SnapshotOrchestrator::RunHarvest(std::string savePath) {
     m_lastStateKey = StateKey();
     m_lastSnapshotUnixMs = NowUnixMs();
 
-    const auto snapshotDir = Store::SnapshotPaths::SnapshotDir(doc->saveId, doc->characterName);
+    // Two naming rules, one per kind of export - see `AutoDirectoryName`. A manual
+    // export refreshes the one directory that belongs to this playthrough; an
+    // automatic one gets a directory of its own, because the point of automatic
+    // exports is to have the last several to choose between.
+    //
+    // Set on the document as well as used here, because the side-car categories
+    // have already read it off `ctx.doc` to decide where to copy their files - so
+    // the two must be the same path by construction rather than by both computing
+    // it. Note this must be assigned before the harvest loop runs; it is, because
+    // `RunHarvest` set it up top.
+    const auto snapshotDir = doc->snapshotDir;
+
+    const auto automatic = m_automatic;
+    const auto keepAuto = static_cast<uint32_t>(Config::MigrationConfig::KeepAutoExports());
+    const auto saveId = doc->saveId;
 
     // ── B1 boundary: everything past here is file work on the worker ───────
-    Worker::Get().Post("snapshot-write", [this, doc, sink, snapshotDir]() {
+    Worker::Get().Post("snapshot-write", [this, doc, sink, snapshotDir, automatic, keepAuto,
+                                          saveId]() {
         auto report = sink->Finish();
         const auto writeResult = Store::SnapshotWriter::Write(snapshotDir, *doc);
         if (!writeResult.success) {
@@ -375,6 +490,15 @@ void SnapshotOrchestrator::RunHarvest(std::string savePath) {
         info.snapshotId = Util::PathToUtf8String(snapshotDir.filename());
         info.categoriesWritten = writeResult.categoriesWritten;
         info.categoriesFailed = writeResult.categoriesFailed;
+        info.automatic = automatic;
+
+        // Pruned only after a *successful* automatic write, and on this thread so
+        // the delete cannot overlap the write it is making room after. Failing to
+        // write and then deleting an older generation would spend the history to
+        // buy nothing.
+        if (automatic && writeResult.success) {
+            info.prunedCount = Store::SnapshotLibrary::PruneAutoSnapshots(saveId, keepAuto);
+        }
 
         m_inFlight.store(false);
 

@@ -100,6 +100,10 @@ SnapshotWriter::Result SnapshotWriter::Write(const fs::path& snapshotDir,
         {"pluginVersion", doc.pluginVersion},
         {"gameRuntime", doc.gameRuntime},
         {"layoutSuspect", doc.layoutSuspect != 0},
+        // Whether `bAutoExportOnSave` took this or the player asked for it. The
+        // pruner deletes only automatic ones and the menu labels them, so this is
+        // the one field both of those depend on.
+        {"auto", doc.automatic != 0},
         {"source",
          {
              {"saveId", doc.saveId},
@@ -133,9 +137,41 @@ SnapshotWriter::Result SnapshotWriter::Write(const fs::path& snapshotDir,
         }
     }
 
+    // ── Adopt the side-car tree into this generation ───────────────────────
+    //
+    // The side-car categories - RaceMenu presets, VR Editor's files, TNG's
+    // settings, the SkyrimNet database - copy hundreds of megabytes, so they do
+    // it on the worker rather than inside the harvest. They post their tasks from
+    // `Collect`, this write is posted from the end of the harvest, and the worker
+    // is a single FIFO thread: by the time we get here their files are already on
+    // disk, under `<snapshotDir>/system/`. They are *this* generation's files.
+    //
+    // Without this they were lost on every export after the first. The rotation
+    // below moves everything in the live directory into `.previous/`, which took
+    // the just-written `system/` with it, and the staging directory promoted over
+    // the top had no `system/` of its own. The first export of a playthrough
+    // looked right because there was no live generation to rotate, which is
+    // exactly why it went unnoticed.
+    std::error_code ec;
+    {
+        const auto liveSideCar = snapshotDir / "system";
+        if (fs::exists(liveSideCar, ec) && !ec) {
+            const auto stagedSideCar = staging / "system";
+            if (Util::MovePath(liveSideCar, stagedSideCar)) {
+                spdlog::info("SnapshotWriter: adopted the side-car tree into this generation");
+            } else {
+                // Not fatal, and deliberately loud: the snapshot is still valid,
+                // it just will not carry the side-car payloads.
+                spdlog::error("SnapshotWriter: could not move '{}' into staging; this snapshot's "
+                              "side-car files (presets, VR Editor, SkyrimNet) will be lost",
+                              Util::PathToUtf8String(liveSideCar));
+            }
+        }
+        ec.clear();
+    }
+
     // ── Rotate and swap ───────────────────────────────────────────────────
     const auto previous = SnapshotPaths::Previous(snapshotDir);
-    std::error_code ec;
     const bool hasLive = fs::exists(SnapshotPaths::Manifest(snapshotDir), ec);
 
     if (hasLive) {

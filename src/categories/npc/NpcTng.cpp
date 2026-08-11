@@ -236,7 +236,8 @@ const Core::CategoryDescriptor& NpcTng::Describe() const {
     return descriptor;
 }
 
-void NpcTng::PrepareCollect(RE::PlayerCharacter* player) {
+void NpcTng::PrepareCollect(RE::PlayerCharacter* player,
+                            const std::vector<Model::ActorSubject>&) {
     ResetPrimed();
     if (!player) {
         return;
@@ -274,8 +275,38 @@ void NpcTng::PrepareCollect(RE::PlayerCharacter* player) {
 }
 
 void NpcTng::CollectActor(const Model::ActorSubject& subject, Core::CollectContext& ctx) {
-    // Only the player. NPC state already carries over: TNG keys it off the TESNPC
-    // base in a global, non-per-save INI.
+    // Only the player, and this is worth stating with evidence rather than as an
+    // assertion, because it is the obvious thing to get wrong: you *can* assign an
+    // addon to an NPC in game (the NPCEdit hotkey, and the MCM), so the natural
+    // assumption is that the choice is per-save and needs carrying.
+    //
+    // It is not. Verified against TheNewGentleman.dll and a live
+    // TheNewGentleman5.ini on 2026-08-10:
+    //
+    //   - The only save-scoped thing TNG stores is the *player*. Its INI layer
+    //     exposes exactly one loader that takes a save id -
+    //     `Inis::LoadPlayerInfos(const std::string&)` - and the sections it writes
+    //     are named `[PlayerInfo<8 hex digits>]`, where those digits are the save
+    //     line's id. The observed file held `[PlayerInfo00000000]`,
+    //     `[PlayerInfo24CB5312]` and `[PlayerInfoE223B073]`, the last matching the
+    //     `Save8_E223B073_...` file beside it.
+    //   - NPC choices go to flat, unscoped `[NPCGenitalAddon]` and
+    //     `[NPCGenitalSize]` sections keyed by the TESNPC base, e.g.
+    //     `0x14120~Skyrim.esm = 0xd77~SOS - TRX - Futanari Addon_NG.esp`. Nothing
+    //     in the section name varies by save.
+    //   - TNG writes **no SKSE co-save record at all**. Scanning a 4.9 MB co-save
+    //     from this playthrough found `TheNewGentleman` only inside plugin
+    //     load-order lists, never as a record owner.
+    //
+    // So an in-game NPC assignment is written to a global file and applies to
+    // every save on the install, including one started tomorrow. Migrating it
+    // would mean writing a value that is already correct.
+    //
+    // The one genuine gap is an addon assigned to a *dynamically spawned* actor:
+    // TNG's setter takes the reference as well as the base, and a `0xFF` reference
+    // id is an allocator value private to one save. That is unmigratable by
+    // construction, for the same reason the roster refuses dynamic refs, and
+    // carrying it would resolve to an unrelated object.
     if (!subject.isPlayer || !subject.actor) {
         return;
     }
@@ -354,11 +385,11 @@ void NpcTng::CollectActor(const Model::ActorSubject& subject, Core::CollectConte
     if (haveSize) {
         payload["size"] = size;
     }
-    payload["note"] =
-        "Addon is stored as a FormKey, never an index: SetActorAddon takes an index into the "
-        "per-race applicable list, which shifts when addons are installed or removed. The applier "
-        "matches by name, then re-reads GetActorAddon and compares FormKeys, sweeping indices if "
-        "the name match landed wrong.";
+    // No explanatory `note` here. It was the same constant sentence in every
+    // payload of every export, describing why the addon is stored as a FormKey -
+    // which is a fact about this code, not about the save, and is already said
+    // where it belongs, at the top of this file. The conditional note above stays:
+    // that one reports something that actually happened.
 
     ctx.report.Succeeded(Report::PlayerSubject(), std::format("{}/tng", subject.refKey),
                          subject.refKey, "TNG player addon");

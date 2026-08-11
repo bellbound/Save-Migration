@@ -100,7 +100,11 @@ public:
     /// code did before the questions existed, so a caller that does not ask still
     /// gets the old behaviour.
     struct ImportOptions {
-        /// Copy `prompts/_saves/<old>` into `prompts/_saves/<new>`.
+        /// Copy `prompts/_saves/<old>` into `prompts/_saves/<new>`, in full:
+        /// character bios, the player's own `player_special.prompt`, the
+        /// `dynamic/` bio updates, the `imgs/` portraits and the timestamped
+        /// `.backup` files. A recursive copy with no filter, so this is a single
+        /// all-or-nothing switch rather than a per-kind one.
         bool copyPromptArchive = true;
 
         /// Rewrite the old character's name in the narrative text. Empty `from`

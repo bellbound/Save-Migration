@@ -47,16 +47,28 @@ bool IsSwapFileName(const std::string& name) {
     return name.find("_SWAP") != std::string::npos;
 }
 
-/// Forward slashes, so an index written on one machine reads on another and so
+/// A search root and a file name joined into a forward-slashed relative key.
+///
+/// Forward slashes so an index written on one machine reads on another and so
 /// the JSON is not full of escaped backslashes.
-std::string ToRelativeKey(const fs::path& relative) {
-    auto text = Util::PathToUtf8String(relative);
-    for (auto& c : text) {
-        if (c == '\\') {
-            c = '/';
-        }
+///
+/// **Built, not subtracted.** This used to be
+/// `fs::relative(item.path(), Util::DataFolder())`, and under Mod Organizer that
+/// returned `../../../../skyrim/MGO4/overwrite/VREditor_SWAP.ini` for every file
+/// that really lived in the overwrite folder: the paths the VFS hands back for
+/// redirected entries are not under the Data folder they were listed through, so
+/// `fs::relative` gave a perfectly correct relative path to somewhere outside the
+/// snapshot. Joined onto `system/vreditor/`, those keys wrote fifteen files into
+/// `%LOCALAPPDATA%/SaveMigration/skyrim/` and left the snapshot holding nothing
+/// but an index of them.
+///
+/// Both pieces here are trustworthy on either side of the VFS: the root is a
+/// literal, and a directory entry's file name is its file name.
+std::string JoinKey(std::string_view root, std::string_view fileName) {
+    if (root.empty()) {
+        return std::string(fileName);
     }
-    return text;
+    return std::string(root) + "/" + std::string(fileName);
 }
 
 }  // namespace
@@ -86,15 +98,16 @@ std::vector<VrEditorFiles::Entry> VrEditorFiles::Enumerate() {
             if (root.rootOfData && !IsVrEditorFileName(name)) {
                 continue;
             }
-
-            Entry entry;
-            entry.relativePath = ToRelativeKey(fs::relative(item.path(), dataFolder, ec));
-            if (ec || entry.relativePath.empty()) {
+            if (name.empty()) {
                 continue;
             }
-            entry.bytes = static_cast<uint64_t>(fs::file_size(item.path(), ec));
+
+            Entry entry;
+            entry.relativePath = JoinKey(root.relativeDir, name);
+            entry.bytes = static_cast<uint64_t>(fs::file_size(dir / item.path().filename(), ec));
             if (ec) {
                 entry.bytes = 0;
+                ec.clear();
             }
             entry.isSwapFile = IsSwapFileName(name);
             entry.isConfig = Util::IEquals(name, kConfigFileName);
@@ -126,8 +139,18 @@ VrEditorFiles::SnapshotResult VrEditorFiles::TakeSnapshot(const fs::path& snapsh
     }
 
     for (const auto& entry : entries) {
-        const auto from = dataFolder / fs::path(entry.relativePath);
-        const auto to = targetRoot / fs::path(entry.relativePath);
+        const fs::path relative(entry.relativePath);
+        // Checked rather than assumed: this is the exact failure that put fifteen
+        // files outside the snapshot, and a guard here is what makes the new
+        // construction verifiable instead of merely believed.
+        if (!Util::IsContainedRelativePath(relative)) {
+            spdlog::error("VrEditorFiles: refusing '{}' - it does not stay inside the snapshot",
+                          entry.relativePath);
+            continue;
+        }
+
+        const auto from = dataFolder / relative;
+        const auto to = targetRoot / relative;
 
         if (!Util::EnsureDirectory(to.parent_path())) {
             spdlog::warn("VrEditorFiles: could not create {}",
@@ -173,7 +196,14 @@ VrEditorFiles::RestoreResult VrEditorFiles::Restore(const fs::path& snapshotDir,
         }
 
         const auto relative = fs::relative(item.path(), sourceRoot, ec);
-        if (ec || relative.empty()) {
+        if (ec || !Util::IsContainedRelativePath(relative)) {
+            // A snapshot can be hand-copied in from anywhere, so its layout is
+            // input rather than something we know. Anything that would not stay
+            // under `Data/` is refused instead of written.
+            spdlog::error(
+                "VrEditorFiles: refusing '{}' from the snapshot - it does not stay inside Data",
+                Util::PathToUtf8String(item.path()));
+            ec.clear();
             continue;
         }
         const auto name = Util::PathToUtf8String(item.path().filename());

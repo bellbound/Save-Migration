@@ -33,7 +33,13 @@ void NpcInventory::CollectActor(const Model::ActorSubject& subject, Core::Collec
     auto& payload = ctx.ActorPayload(kId, subject.refKey);
     const auto itemCount = collected.items.size();
     payload["items"] = std::move(collected.items);
-    payload["unmigratable"] = std::move(collected.unmigratable);
+    // Only when there is something in it. The applier looks the key up and
+    // tolerates its absence, and an empty array per actor meant twenty-five
+    // `"unmigratable": []` lines in a file describing twenty-five NPCs who had
+    // nothing of the kind.
+    if (!collected.unmigratable.empty()) {
+        payload["unmigratable"] = std::move(collected.unmigratable);
+    }
 
     // The default and sleep outfits are recorded because a fresh save's NPC
     // re-equips their default outfit when their 3D loads, and that re-equip will

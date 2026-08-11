@@ -8,16 +8,18 @@ namespace SaveMigration::Core {
 
 /// Delays a message box until the player can actually see and answer it.
 ///
-/// `kPostLoadGame` fires while the loading screen is still up, and a message box
-/// queued then is swallowed by the UI - the callback never runs and the box never
-/// appears. Loading an older save also routinely raises *other* mods' boxes in
-/// the same second; queueing behind one of those puts our question in front of an
-/// answer the player was part-way through giving.
+/// There are no load-time prompts left; what is left is the import-outcome
+/// summary, and it needs this just as badly. A restore runs one phase per frame
+/// across many frames of real time, and finishes wherever the player happens to
+/// be - which may be inside a loading screen they triggered mid-run, or behind
+/// another mod's box. A message box queued then is swallowed by the UI: the
+/// callback never runs and the box never appears, so the player is told nothing
+/// about an import that did happen.
 ///
 /// So the gate waits for three things, and re-checks them rather than trusting a
 /// single fixed delay, because a slow load outlasts any delay worth choosing:
 ///
-///   1. `iPromptDelayMs` has elapsed since the load - other mods get first say;
+///   1. `kDefaultDelayMs` has elapsed - anyone else mid-conversation gets first say;
 ///   2. `LoadingMenu` is closed;
 ///   3. no message box, ours or anyone else's, currently owns the screen.
 ///
@@ -32,11 +34,15 @@ public:
     /// `kMaxAttempts`, it is dropped and the drop is logged and surfaced in game -
     /// a swallowed prompt is indistinguishable from a broken plugin otherwise.
     ///
-    /// `initialDelayMs` of -1 means `iPromptDelayMs`, which is right for the
-    /// first prompt after a load. A *follow-up* to a box the player just answered
-    /// should pass something short: the courtesy delay exists to let other mods
-    /// go first, and they have already had it.
+    /// `initialDelayMs` of -1 means `kDefaultDelayMs`. A *follow-up* to a box the
+    /// player just answered should pass `kFollowUpDelayMs`: the courtesy delay
+    /// exists to let other mods go first, and they have already had it.
     static void Arm(std::string label, std::function<void()> show, int initialDelayMs = -1);
+
+    /// The courtesy wait before the first poll. No longer an INI setting: the one
+    /// remaining caller fires at the end of an import rather than in the crowded
+    /// second after a load, so there is nothing left for a player to want to tune.
+    static constexpr uint32_t kDefaultDelayMs = 3000;
 
     /// Enough for the previous box to finish tearing down, and short enough that
     /// two chained questions read as one exchange.

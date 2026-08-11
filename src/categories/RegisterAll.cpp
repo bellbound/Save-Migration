@@ -28,8 +28,11 @@
 #include "categories/npc/NpcSkyrimNetAccompany.h"
 #include "categories/npc/NpcTng.h"
 #include "categories/npc/NpcWaitState.h"
+#include "categories/mods/ModSupport.h"
 #include "categories/system/LoadOrderCategory.h"
+#include "categories/system/RaceMenuPresetsCategory.h"
 #include "categories/system/SkyrimNetSideCarCategory.h"
+#include "categories/system/TngIniCategory.h"
 #include "categories/system/VrEditorFilesCategory.h"
 #include "categories/world/ClearedLocations.h"
 #include "categories/world/StoredContainers.h"
@@ -163,6 +166,24 @@ void RegisterAllCategories() {
     // Pure file copying, with nothing in the run reading it, so it sits with the
     // other file work rather than earlier.
     registry.AddGlobal(std::make_unique<VrEditorFilesCategory>());
+    // Also pure file copying. Independent of everything else in the run - the
+    // presets are read by RaceMenu's own menu, not by anything this plugin
+    // writes - so it only needs to be somewhere in this phase.
+    registry.AddGlobal(std::make_unique<RaceMenuPresetsCategory>());
+    // Reads TNG's settings file and records it as JSON. Snapshot-only, and after
+    // NpcTng has already had its say - it must never be mistaken for the route
+    // that restores the player's addon, which is npc.tng through TNG's own API.
+    registry.AddGlobal(std::make_unique<TngIniCategory>());
+
+    // Mod Support: one category per bundle in `ModBundles()`, each carrying one
+    // mod's files whole. Registered from the table rather than listed here because
+    // there is nothing per-bundle to say about ordering - none of them is read by
+    // anything else in the run, and the mods that read them do so at their own next
+    // startup. Adding a mod is therefore a table entry, not a code change.
+    for (const auto& bundle : ModBundles()) {
+        registry.AddGlobal(std::make_unique<ModSupportCategory>(bundle));
+    }
+
     registry.AddGlobal(std::make_unique<GameClock>());
 
     registry.Freeze();

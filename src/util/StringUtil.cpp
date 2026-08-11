@@ -203,6 +203,17 @@ std::vector<std::string> SplitAndTrim(std::string_view text, char delim) {
     return out;
 }
 
+std::string JoinStrings(const std::vector<std::string>& parts, std::string_view separator) {
+    std::string out;
+    for (const auto& part : parts) {
+        if (!out.empty()) {
+            out.append(separator);
+        }
+        out.append(part);
+    }
+    return out;
+}
+
 bool IEquals(std::string_view a, std::string_view b) {
     if (a.size() != b.size()) {
         return false;

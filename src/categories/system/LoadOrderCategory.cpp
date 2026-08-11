@@ -41,7 +41,12 @@ void LoadOrderCategory::Collect(Core::CollectContext& ctx) {
     for (const auto& name : Model::WellKnownForms::Get().Unresolved()) {
         unresolved.push_back(name);
     }
-    payload["unresolvedWellKnownForms"] = std::move(unresolved);
+    // Written only when something failed to resolve. On a healthy install this
+    // was an empty array in every export, which is the same information as the
+    // field not being there.
+    if (!unresolved.empty()) {
+        payload["unresolvedWellKnownForms"] = std::move(unresolved);
+    }
     payload["vrLayoutTrusted"] = Core::VRLayoutProbe::Get().IsLayoutTrusted();
     payload["vrLayoutDetail"] = Core::VRLayoutProbe::Get().Detail();
 

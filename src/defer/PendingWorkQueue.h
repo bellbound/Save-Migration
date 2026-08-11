@@ -83,6 +83,10 @@ public:
     /// engine and the engine can call back into the sinks.
     [[nodiscard]] std::vector<PendingItem> Items() const;
 
+    /// As `Items`, and reports the generation the copy was taken at, so a drain
+    /// can tell afterwards whether the queue was mutated underneath it.
+    [[nodiscard]] std::vector<PendingItem> Items(uint64_t& generationOut) const;
+
     /// Install the result of a drain pass.
     ///
     /// `survivors` is what the drain decided to keep. `processed` names every
@@ -91,8 +95,14 @@ public:
     /// wiped - unless it is a re-queue of a key the drain just retired, which is
     /// dropped because honouring it would put the item straight back with its
     /// attempt counter reset and never terminate.
+    ///
+    /// `generationAtStart` is what `Items` reported. When the generation has not
+    /// moved, nothing was enqueued during the pass and the reconciliation - which
+    /// is quadratic in the queue size - is skipped entirely. That is the normal
+    /// case; an applier enqueueing mid-drain is the exception.
     void CommitDrain(std::vector<PendingItem> survivors,
-                     const std::vector<std::pair<std::string, std::string>>& processed);
+                     const std::vector<std::pair<std::string, std::string>>& processed,
+                     uint64_t generationAtStart);
 
     /// Replace the queue wholesale. Debug/administrative use only; a drain must
     /// go through `CommitDrain`.

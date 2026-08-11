@@ -1,19 +1,21 @@
 #pragma once
 
-#include <atomic>
+#include <filesystem>
 #include <string>
 
 #include "core/SnapshotOrchestrator.h"
-
-namespace SaveMigration::Store {
-struct SnapshotSummary;
-}
 
 namespace SaveMigration::Core {
 
 /// Turns the SKSE message stream into snapshot and restore decisions.
 ///
 /// `plugin.cpp` hands every message here and keeps nothing of its own.
+///
+/// There are no load-time prompts. The MCM is the interface: it starts exports
+/// and imports, and this class is what those two buttons ultimately reach, so
+/// the sequencing that has to happen around each one - the SkyrimNet roster read
+/// before a harvest, the SkyrimNet questions before a restore - lives in exactly
+/// one place regardless of who asked.
 class LifecycleController {
 public:
     static LifecycleController& Get();
@@ -29,50 +31,57 @@ public:
 
     [[nodiscard]] const std::string& LastSavePath() const { return m_lastSavePath; }
 
+    /// The harvest, with the SkyrimNet roster read in front of it.
+    ///
+    /// `force` bypasses the world-state gates, which is what the menu's export
+    /// button wants: the player has just asked for a snapshot in so many words,
+    /// so "one was taken recently" is not a reason to refuse. It does **not**
+    /// bypass the roster read - an export that skipped that would quietly lose
+    /// the talked-to list every NPC integration is built on.
+    ///
+    /// `automatic` says `bAutoExportOnSave` asked for this rather than a person.
+    /// It decides the directory name, the manifest's `auto` flag, whether the
+    /// pruner runs afterwards, and - the visible part - whether success is
+    /// announced. `force` and `automatic` are independent: an automatic export is
+    /// never forced, because the anti-thrash gates are the whole reason it does
+    /// not fire on every save.
+    void BeginSnapshot(bool force, bool automatic = false);
+
+    /// Ask the SkyrimNet questions, then run the restore.
+    ///
+    /// Public because the menu is what starts an import now. The questions are
+    /// message boxes, but they are not load-time prompts: they follow a button
+    /// the player pressed, and each answer changes what the run does - so they
+    /// cannot be asked once it is already under way.
+    void BeginImport(std::filesystem::path snapshotDir, std::string oldCharacterName);
+
 private:
     LifecycleController() = default;
 
-    void HandleSnapshotBranch();
-    void HandleRestoreBranch();
-
-    // ── Export ────────────────────────────────────────────────────────────
-
-    /// "Do you want to export this save's data?"
-    void AskExport();
-    /// Only after a decline. "Ask again on future game loads?", whose No leaves
-    /// export mode - the only way out of it from in game short of an accepted
-    /// export, which offers the same thing once it has actually succeeded.
-    void AskKeepAskingExport();
-    /// The harvest itself, with the SkyrimNet roster read in front of it.
-    void BeginSnapshot();
-    /// Report the harvest, and - if we were the ones who asked for it - offer to
-    /// leave export mode now that there is a snapshot to show for it.
+    /// Report the harvest. A corner notification and the log, never a box - an
+    /// export is either something the menu is watching or something
+    /// `bAutoExportOnSave` did in the background, and neither wants a modal.
+    ///
+    /// A *successful automatic* export says nothing at all. It happens every Nth
+    /// save for as long as the setting is on, and a message every time would be
+    /// the plugin interrupting play to report that nothing needed reporting. A
+    /// failure is announced whoever asked for it: that one the player has to know.
     void OnExportFinished(const SnapshotOrchestrator::CompletionInfo& info);
 
-    // ── Import ────────────────────────────────────────────────────────────
-
-    /// Every gate that must hold before the prompt may appear. `reasonOut`
-    /// explains a refusal.
-    [[nodiscard]] bool ShouldOfferRestore(std::string& reasonOut);
+    /// Saves seen this session, for `iAutoExportEverySaves`.
+    ///
+    /// Session-scoped and in memory rather than in the co-save, deliberately. It
+    /// is a "how often" dial, not a record of anything, and putting it in the
+    /// co-save would mean every quickload rewound the counter to whatever it was
+    /// when that save was written - so the interval would depend on load history
+    /// rather than on how much has been played.
+    uint32_t m_savesThisSession = 0;
 
     /// Set `kSeenNewGame` when this session's game was started fresh, for the
     /// ways of starting one that send no `kNewGame`. See the definition.
     void MarkNewGameIfStartedFresh();
 
-    /// "Detected a snapshot of <name> from <date>. Apply it?"
-    void OfferImport(const Store::SnapshotSummary& summary);
-    /// Only after a decline. A yes runs the import and sets the co-save flag, so
-    /// there is nothing left to stop asking about.
-    void AskStopAskingImport(std::string snapshotId);
-
     std::string m_lastSavePath;
-    /// One offer per load, each way. Both are cleared at `kPreLoadGame`.
-    bool m_promptShown = false;
-    bool m_exportPromptShown = false;
-    /// True when *we* asked before exporting, so the completion box is only
-    /// shown to a player who was part of a conversation. An automatic export
-    /// (`bAskBeforeExport=0`) gets a notification and nothing more.
-    bool m_exportWasOffered = false;
     /// True once any savegame load has been seen this session. Deliberately not
     /// reset: it is only ever read to *withhold* the fresh-playthrough flag, so
     /// a stale true costs an offer, never a wrong one.

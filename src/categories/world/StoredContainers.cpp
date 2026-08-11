@@ -17,7 +17,15 @@ constexpr std::string_view kId = "world.stored_containers";
 /// A ceiling on how many containers get written down, so a load order that
 /// somehow marks everything as changed cannot turn one harvest into a
 /// hundred-megabyte file. Reaching it is reported rather than swallowed.
-constexpr size_t kMaxContainers = 4000;
+///
+/// Deliberately far above anything real, because it is a backstop and nothing
+/// else - the pass-one filter below is what makes this category affordable, and
+/// the ceiling only exists so a pathological load order cannot make us allocate
+/// without bound. It used to be 4000, which a normal save reached: an install
+/// with 16898 container references had 6641 worth reading, so the cap was
+/// silently truncating a third of a real export. Nothing about 4000 was a
+/// correctness bound.
+constexpr size_t kMaxContainers = 50000;
 
 /// The container's default contents, as the level designer left them.
 std::map<RE::TESBoundObject*, int32_t> BaseContents(const RE::TESObjectCONT* container) {
@@ -222,6 +230,18 @@ void StoredContainers::Apply(Core::ApplyContext& ctx) {
     if (containers == payload.end() || !containers->is_array()) {
         ctx.report.SkipCategory(Report::ReasonCode::kNone, "no stored containers in the snapshot");
         return;
+    }
+
+    if (m_cursor == 0) {
+        // Said once, at the start, rather than per container. This category is
+        // off by default and this is the reason: it is the one import that
+        // reaches out and rewrites the world's own furniture.
+        ctx.report.Info(
+            "Stored containers writes into every container in this save that it recognises from "
+            "the snapshot, topping each one up to what the other save had in it. That is a lot of "
+            "chests, barrels and cupboards - anything the old character ever put something into. "
+            "It only ever adds: a container is never emptied, and what this save's own copy "
+            "already held stays.");
     }
 
     auto& resolver = Model::FormResolver::Get();

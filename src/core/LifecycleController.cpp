@@ -7,7 +7,6 @@
 #include "categories/player/PlayerMapMarkers.h"
 #include "config/MigrationConfig.h"
 #include "core/MigrationState.h"
-#include "core/PromptGate.h"
 #include "core/RestoreOrchestrator.h"
 #include "core/SaveIdentity.h"
 #include "core/SerializationHub.h"
@@ -19,6 +18,7 @@
 #include "model/StandingStoneTable.h"
 #include "model/WellKnownForms.h"
 #include "papyrus/ModProbe.h"
+#include "papyrus/SaveMigrationMcmApi.h"
 #include "store/LoadOrderFingerprint.h"
 #include "store/SkyrimNetDbSwap.h"
 #include "store/SkyrimNetSideCar.h"
@@ -32,7 +32,12 @@ namespace SaveMigration::Core {
 
 namespace {
 
-/// The SkyrimNet questions, asked between "yes, apply it" and the run itself.
+/// The SkyrimNet questions, asked between "apply this snapshot" and the run itself.
+///
+/// These survive the removal of the load-time prompts because they are not prompts:
+/// nothing raises them unprompted, they follow a button the player pressed, and each
+/// answer decides what the run about to start actually does. Defaulting them silently
+/// would answer four real questions with "no" on the player's behalf.
 ///
 /// One box per decision, chained through the callbacks, because a Skyrim message box
 /// answers asynchronously and there is no way to ask two things at once. Each box is
@@ -114,8 +119,13 @@ private:
     static void AskPrompts(const std::string& oldName, const std::string& newName,
                            std::function<void()> proceed) {
         MessageBoxUtil::ShowYesNo(
-            "SkyrimNet Migration: Do you want to copy your Dynamic Bio Updates and save-specific "
-            "character Bio's to the new save?",
+            // Names every part of the archive, because it is one all-or-nothing
+            // switch over the whole `prompts/_saves/<id>` tree - character bios,
+            // dynamic bio updates, the player's own bio and the portrait images
+            // alike. Naming only two of them read as though the rest were left
+            // behind.
+            "SkyrimNet Migration: Do you want to copy your character Bio's, Dynamic Bio Updates, "
+            "your own Player Bio and the portrait images to the new save?",
             [oldName, newName, proceed = std::move(proceed)](unsigned int choice) mutable {
                 auto choices = SkyrimNetImportChoices::Get();
                 choices.copyPromptArchive = (choice == 0);
@@ -179,27 +189,24 @@ void LifecycleController::OnDataLoaded() {
     // there is no per-event cost in the common case.
     Defer::DeferredRestoreManager::Get().RegisterSinks();
 
-    spdlog::info("LifecycleController: data loaded, mode is {}",
-                 Config::MigrationConfig::IsSnapshotMode() ? "SNAPSHOT" : "RESTORE");
+    spdlog::info("LifecycleController: data loaded, automatic export on save is {} (every {} "
+                 "save(s), keeping {})",
+                 Config::MigrationConfig::AutoExportOnSave() ? "on" : "off",
+                 Config::MigrationConfig::AutoExportEverySaves(),
+                 Config::MigrationConfig::KeepAutoExports());
 }
 
 void LifecycleController::OnNewGame() {
     SaveIdentity::Get().EnsureId();
     MigrationState::Get().SetFlag(StateFlag::kSeenNewGame);
-    // Deliberately no prompt here. The requirement is "started, *saved*, then
-    // *loaded*" - a brand-new game has no restorable identity yet, and the
-    // player is still in the cart.
-    //
     // This is the message path only. It is not the only way a fresh playthrough
     // begins, so the same flag is also derived at save time - see
     // MarkNewGameIfStartedFresh.
-    spdlog::info("LifecycleController: new game seen; a restore will be offered after a save+reload");
+    spdlog::info("LifecycleController: new game seen");
 }
 
 void LifecycleController::OnPreLoadGame(const char* savePath) {
     m_lastSavePath = savePath ? savePath : "";
-    m_promptShown = false;
-    m_exportPromptShown = false;
     // Fires for every savegame load, whether or not that save has a co-save.
     // That is what makes it worth recording separately from the hub's flag.
     m_sawSaveLoadThisSession = true;
@@ -219,10 +226,47 @@ void LifecycleController::OnSaveGame(const char* savePath) {
     // The last moment before SMST is written, which is where the flag has to be.
     MarkNewGameIfStartedFresh();
 
-    // Never snapshot on save. Load is the moment the world is coherent: on save,
-    // scripts may be mid-fragment and cells mid-attach.
-    spdlog::debug("LifecycleController: save '{}' (no snapshot taken on save by design)",
-                  savePath ? savePath : "");
+    ++m_savesThisSession;
+
+    if (!Config::MigrationConfig::AutoExportOnSave()) {
+        spdlog::debug("LifecycleController: save '{}' (automatic export is off)",
+                      savePath ? savePath : "");
+        return;
+    }
+
+    const auto every = static_cast<uint32_t>(Config::MigrationConfig::AutoExportEverySaves());
+    if (m_savesThisSession % every != 0) {
+        spdlog::debug("LifecycleController: save {} of every {}; not exporting yet",
+                      m_savesThisSession % every, every);
+        return;
+    }
+
+    // **Not from inside this callback.** `kSaveGame` fires while the save is being
+    // written: script fragments can be mid-run and cells mid-attach, which is why
+    // this used to say "never snapshot on save" and harvest on load instead. What
+    // was wrong with that was the choice of moment, not the objection - a session
+    // that plays for hours and saves twenty times loads once, so harvesting on
+    // load recorded where the session *started*.
+    //
+    // So: harvest a beat after the save instead of during it. One second of real
+    // time is long enough for the engine to have finished writing and for any
+    // save-triggered script fragment to have run, and the world it describes is
+    // the world the save describes - which is the whole point.
+    //
+    // Not forced: the gates are what stop this firing on a quicksave-heavy stretch
+    // where nothing has actually changed.
+    constexpr uint32_t kPostSaveDelayMs = 1000;
+    spdlog::info("LifecycleController: save {} - queueing an automatic export in {} ms",
+                 m_savesThisSession, kPostSaveDelayMs);
+    Util::OnGameThreadAfter(kPostSaveDelayMs, []() {
+        auto& self = LifecycleController::Get();
+        std::string reason;
+        if (!SnapshotOrchestrator::Get().ShouldTake(reason)) {
+            spdlog::info("LifecycleController: no automatic export after the save - {}", reason);
+            return;
+        }
+        self.BeginSnapshot(/*force=*/false, /*automatic=*/true);
+    });
 }
 
 void LifecycleController::MarkNewGameIfStartedFresh() {
@@ -267,13 +311,18 @@ void LifecycleController::OnPostLoadGame(bool loadSucceeded) {
         return;
     }
 
-    if (Config::MigrationConfig::IsSnapshotMode()) {
-        HandleSnapshotBranch();
-    } else {
-        HandleRestoreBranch();
-    }
+    // Nothing is harvested here any more. The automatic export moved to
+    // `OnSaveGame`, because a load is not where a playthrough advances: a session
+    // that plays for three hours and saves twenty times loads exactly once, so
+    // harvesting on load recorded the state the session began from and never the
+    // state it reached.
+    //
+    // The save counter is deliberately *not* reset here. A load in the middle of a
+    // session is not the start of a new one, and resetting would let a
+    // load-heavy stretch push the next automatic export arbitrarily far away.
 
-    // Independent of branch: a queue that survived a save must still drain.
+    // A queue that survived a save must still drain, whether or not anything
+    // was exported.
     Defer::DeferredRestoreManager::Get().OnGameLoaded();
 
     // Map marker flags are re-asserted on *every* load, not only during a restore.
@@ -283,133 +332,35 @@ void LifecycleController::OnPostLoadGame(bool loadSucceeded) {
     Categories::PlayerMapMarkers::ReassertAfterLoad();
 }
 
-void LifecycleController::HandleSnapshotBranch() {
-    std::string reason;
-    if (!SnapshotOrchestrator::Get().ShouldTake(reason)) {
-        spdlog::info("LifecycleController: no snapshot - {}", reason);
-        return;
-    }
-
-    if (!Config::MigrationConfig::AskBeforeExport()) {
-        spdlog::info("LifecycleController: exporting without asking (bAskBeforeExport=0)");
-        m_exportWasOffered = false;
-        BeginSnapshot();
-        return;
-    }
-
-    if (m_exportPromptShown) {
-        return;
-    }
-    m_exportPromptShown = true;
-    // Gated rather than shown immediately: `kPostLoadGame` fires under the
-    // loading screen, and a box queued there is swallowed.
-    PromptGate::Arm("export-offer", [this]() { AskExport(); });
-}
-
-void LifecycleController::AskExport() {
-    MessageBoxUtil::ShowYesNo(
-        "Save Migration: Do you want to export the current save's Data, so it can be imported in "
-        "another Savegame?",
-        [this](unsigned int choice) {
-            if (choice == 0) {
-                spdlog::info("LifecycleController: export accepted");
-                // Straight to work. The "do you still want to be asked" question
-                // waits until there is a snapshot to point at: asked here it
-                // would be asked in ignorance of whether the export even
-                // succeeded, and answering it would flip the plugin out of
-                // export mode before the export had happened.
-                m_exportWasOffered = true;
-                Util::OnGameThread([this]() { BeginSnapshot(); });
-                return;
-            }
-            spdlog::info("LifecycleController: export declined");
-            // Queued from a later frame, never from inside this callback: this
-            // runs while the UI is still tearing the first box down.
-            Util::OnGameThread([this]() { AskKeepAskingExport(); });
-        });
-}
-
-void LifecycleController::AskKeepAskingExport() {
-    // Short delay: this follows a box the player just answered, so the courtesy
-    // wait that lets other mods go first has already been served.
-    PromptGate::Arm(
-        "export-keep-asking",
-        []() {
-            MessageBoxUtil::ShowYesNo(
-                std::format(
-                    "Save Migration: Do you want to be asked again on future game loads?\n\n"
-                    "Answering No switches export mode off. Set bSnapshot=1 in {} to switch it "
-                    "back on.",
-                    Config::MigrationConfig::kIniFileName),
-                [](unsigned int choice) {
-                    if (choice == 0) {
-                        return;  // keep asking: nothing to write
-                    }
-                    Config::MigrationConfig::SetSnapshotMode(false);
-                });
-        },
-        PromptGate::kFollowUpDelayMs);
-}
-
 void LifecycleController::OnExportFinished(const SnapshotOrchestrator::CompletionInfo& info) {
+    // First, and unconditionally. This is the single point every export - menu
+    // button or `bAutoExportOnSave` - passes through, so recording here is what
+    // lets the menu report on an export it did not start.
+    Papyrus::McmExportStatus::Record(info);
+
     if (!info.success) {
+        // Announced whoever asked. An automatic export that fails silently is an
+        // automatic export the player believes is working.
         spdlog::error("LifecycleController: export failed - {}", info.error);
         RE::DebugNotification("Save Migration: the export failed.");
-        if (!m_exportWasOffered) {
-            return;
-        }
-        PromptGate::Arm(
-            "export-failed",
-            [error = info.error]() {
-                MessageBoxUtil::ShowOK(std::format(
-                    "Save Migration: the export failed and no snapshot was written.\n\n{}\n\n"
-                    "This save is unaffected. The report is in\n"
-                    "My Games\\Skyrim VR\\SKSE\\SaveMigration.",
-                    error.empty() ? "See SaveMigration.log for the reason." : error));
-            },
-            PromptGate::kFollowUpDelayMs);
         return;
     }
 
-    spdlog::info("LifecycleController: export complete - '{}' ({} categories, {} failed)",
-                 info.snapshotId, info.categoriesWritten, info.categoriesFailed);
+    spdlog::info("LifecycleController: export complete - '{}' ({} categories, {} failed{})",
+                 info.snapshotId, info.categoriesWritten, info.categoriesFailed,
+                 info.prunedCount == 0 ? std::string{}
+                                       : std::format(", {} old automatic snapshot(s) deleted",
+                                                     info.prunedCount));
+
+    if (info.automatic) {
+        // Silent. This runs every Nth save for as long as the setting is on, and
+        // the log is where it reports.
+        return;
+    }
     RE::DebugNotification("Save Migration: snapshot saved.");
-
-    if (!m_exportWasOffered) {
-        // An automatic export. The player did not start a conversation, so
-        // finishing one at them would be an interruption, not an answer.
-        return;
-    }
-
-    PromptGate::Arm(
-        "export-done",
-        [info]() {
-            const auto failedNote =
-                info.categoriesFailed == 0
-                    ? std::string{}
-                    : std::format("\n\n{} categor{} could not be recorded - see the report in "
-                                  "My Games\\Skyrim VR\\SKSE\\SaveMigration.",
-                                  info.categoriesFailed,
-                                  info.categoriesFailed == 1 ? "y" : "ies");
-            MessageBoxUtil::ShowYesNo(
-                std::format(
-                    "Save Migration: export complete.{}\n\nStart a new game, save, and load that "
-                    "save - you will be offered the import there.\n\n"
-                    "Switch export mode off now? (Set bSnapshot=1 in {} to switch it back on.)",
-                    failedNote, Config::MigrationConfig::kIniFileName),
-                [](unsigned int choice) {
-                    if (choice != 0) {
-                        return;
-                    }
-                    // Safe here in a way it was not before the harvest: the
-                    // snapshot exists, and nothing is still consulting the mode.
-                    Config::MigrationConfig::SetSnapshotMode(false);
-                });
-        },
-        PromptGate::kFollowUpDelayMs);
 }
 
-void LifecycleController::BeginSnapshot() {
+void LifecycleController::BeginSnapshot(bool force, bool automatic) {
     // Set before any path that can reach `Take`, so a harvest can never finish
     // without the player being told one way or the other.
     SnapshotOrchestrator::Get().SetCompletionHandler(
@@ -424,174 +375,65 @@ void LifecycleController::BeginSnapshot() {
     //
     // The gates are re-evaluated after the read rather than before, because the read
     // takes a few milliseconds and the world could in principle have moved.
+    //
+    // The automatic marking is set immediately before each `Take`, never up here:
+    // `ForceTake` clears it, and a marking left standing across the worker hop
+    // would be inherited by whoever asked next.
     const auto skyrimNetSaveId = Store::SkyrimNetSideCar::CurrentSaveId();
     if (skyrimNetSaveId.empty()) {
         spdlog::info("LifecycleController: taking a snapshot (no SkyrimNet roster source)");
-        SnapshotOrchestrator::Get().Take(m_lastSavePath);
+        if (force) {
+            SnapshotOrchestrator::Get().ForceTake(m_lastSavePath);
+        } else {
+            if (automatic) {
+                SnapshotOrchestrator::Get().MarkNextAsAutomatic();
+            }
+            SnapshotOrchestrator::Get().Take(m_lastSavePath);
+        }
         return;
     }
 
-    Worker::Get().Post("skyrimnet-roster-prime", [this, skyrimNetSaveId]() {
+    Worker::Get().Post("skyrimnet-roster-prime", [this, skyrimNetSaveId, force, automatic]() {
         auto refKeys = Store::SkyrimNetSideCar::ReadTalkedToFromLiveDb(skyrimNetSaveId);
-        Util::OnGameThread([this, refKeys = std::move(refKeys)]() mutable {
+        Util::OnGameThread([this, force, automatic, refKeys = std::move(refKeys)]() mutable {
             if (!refKeys.empty()) {
                 SnapshotOrchestrator::Get().ContributeRosterSource(
                     Util::ActorEnum::ExtraSource{"skyrimnet_talked", std::move(refKeys)});
+            }
+            if (force) {
+                // The player asked for this snapshot by name. "One was taken
+                // recently" and "the state key is unchanged" are anti-thrash
+                // rules for automatic harvests, and neither is a reason to
+                // refuse an explicit request.
+                spdlog::info("LifecycleController: taking a snapshot (forced)");
+                SnapshotOrchestrator::Get().ForceTake(m_lastSavePath);
+                return;
             }
             std::string reason;
             if (!SnapshotOrchestrator::Get().ShouldTake(reason)) {
                 spdlog::info("LifecycleController: no snapshot after roster prime - {}", reason);
                 return;
             }
-            spdlog::info("LifecycleController: taking a snapshot");
+            spdlog::info("LifecycleController: taking a snapshot ({})",
+                         automatic ? "automatic" : "requested");
+            if (automatic) {
+                SnapshotOrchestrator::Get().MarkNextAsAutomatic();
+            }
             SnapshotOrchestrator::Get().Take(m_lastSavePath);
         });
     });
 }
 
-bool LifecycleController::ShouldOfferRestore(std::string& reasonOut) {
-    const auto& state = MigrationState::Get();
-    const auto& identity = SaveIdentity::Get();
+void LifecycleController::BeginImport(std::filesystem::path snapshotDir,
+                                      std::string oldCharacterName) {
+    const auto dirText = Util::PathToUtf8String(snapshotDir);
+    spdlog::info("LifecycleController: beginning an import from '{}'", dirText);
 
-    if (!Config::MigrationConfig::AskBeforeImport()) {
-        reasonOut = "bAskBeforeImport=0";
-        return false;
-    }
-    if (state.HasFlag(StateFlag::kRestoreApplied)) {
-        // The one and only suppressor for "never runs twice". It travels with the
-        // save, survives quickload, and is absent from a genuinely pre-restore
-        // save - so loading backwards past a restore correctly re-offers it.
-        reasonOut = "a restore has already been applied to this save line";
-        return false;
-    }
-    if (state.HasFlag(StateFlag::kRestoreDeclined)) {
-        reasonOut = "the user declined for this save line";
-        return false;
-    }
-    if (RestoreOrchestrator::Get().IsRunning()) {
-        reasonOut = "a restore is already running";
-        return false;
-    }
-    if (!identity.HasReverted()) {
-        // No revert means this is first boot rather than a real savegame load.
-        reasonOut = "no revert seen this session (first boot, not a load)";
-        return false;
-    }
-    if (!identity.WasFoundInCoSave()) {
-        reasonOut = "no SMID in the co-save (this save predates the plugin)";
-        return false;
-    }
-    if (!state.HasFlag(StateFlag::kSeenNewGame)) {
-        // Together with WasFoundInCoSave, this is the "new playthrough that has
-        // been saved and reloaded" detector: the new game minted the id, the save
-        // persisted it, and this load read it back.
-        reasonOut = "this save line did not start as a new game under the plugin";
-        return false;
-    }
-
-    auto* player = RE::PlayerCharacter::GetSingleton();
-    if (!player) {
-        reasonOut = "no player";
-        return false;
-    }
-    const auto level = player->GetLevel();
-    const auto maxLevel = Config::MigrationConfig::MaxLevelForRestore();
-    if (static_cast<int>(level) > maxLevel) {
-        reasonOut = std::format("player is level {}, above iMaxLevelForRestore={}", level, maxLevel);
-        return false;
-    }
-
-    reasonOut.clear();
-    return true;
-}
-
-void LifecycleController::HandleRestoreBranch() {
-    std::string reason;
-    if (!ShouldOfferRestore(reason)) {
-        spdlog::info("LifecycleController: not offering a restore - {}", reason);
-        return;
-    }
-
-    // Snapshot selection is file work, so it goes to the worker. Excluding the
-    // current save's own id is what keeps the plugin silent on the save the
-    // snapshot came from - there is nothing to offer it but itself.
-    const auto currentSaveId = SaveIdentity::Get().SaveId();
-    Worker::Get().Post("restore-select", [this, currentSaveId]() {
-        const auto newest = Store::SnapshotReader::SelectNewest(currentSaveId);
-        if (!newest) {
-            spdlog::info("LifecycleController: no readable snapshot to offer");
-            return;
-        }
-        Util::OnGameThread([this, summary = *newest]() {
-            if (m_promptShown) {
-                return;
-            }
-            m_promptShown = true;
-            PromptGate::Arm("import-offer", [this, summary]() { OfferImport(summary); });
-        });
+    // The SkyrimNet questions come between the request and the run: they decide
+    // what the run does, so they cannot be asked while it is already under way.
+    SkyrimNetQuestions::Begin(dirText, oldCharacterName, [snapshotDir]() {
+        RestoreOrchestrator::Get().Begin(snapshotDir);
     });
-}
-
-void LifecycleController::OfferImport(const Store::SnapshotSummary& summary) {
-    const auto snapshotDir = Util::PathToUtf8String(summary.dir);
-    // The directory name is the snapshot's id everywhere else, so it is what a
-    // decline records too.
-    const auto snapshotId = Util::PathToUtf8String(summary.dir.filename());
-    const auto characterName = summary.characterName.empty() ? "Unnamed" : summary.characterName;
-
-    // The export date is the one field that tells two snapshots of the same
-    // character apart, which is the whole reason the prompt names it.
-    const auto promptText = std::format(
-        "Save Migration: Detected Savegame Snapshot {} from {}. Do you want to apply the saved "
-        "values to this savegame?\n\n"
-        "(level {}, game day {:.1f}. Some parts finish as you meet the NPCs involved.)",
-        characterName, Util::FormatUnixMsLocal(summary.takenAtUnixMs), summary.playerLevel,
-        summary.gameTimeDays);
-
-    MessageBoxUtil::ShowYesNo(promptText, [this, snapshotDir, snapshotId,
-                                           characterName](unsigned int choice) {
-        if (choice == 0) {
-            // The SkyrimNet questions come between the yes and the run: they
-            // decide what the run does, so they cannot be asked while it is
-            // already under way.
-            SkyrimNetQuestions::Begin(snapshotDir, characterName, [snapshotDir]() {
-                RestoreOrchestrator::Get().Begin(std::filesystem::path(snapshotDir));
-            });
-            return;
-        }
-        // Declined for this save line. The flag lives in the co-save, so loading
-        // back past this point correctly re-offers the import.
-        MigrationState::Get().SetFlag(StateFlag::kRestoreDeclined);
-        spdlog::info("LifecycleController: import declined");
-        Util::OnGameThread(
-            [this, snapshotId]() { AskStopAskingImport(snapshotId); });
-    });
-}
-
-void LifecycleController::AskStopAskingImport(std::string snapshotId) {
-    PromptGate::Arm(
-        "import-stop-asking",
-        [snapshotId = std::move(snapshotId)]() {
-            MessageBoxUtil::ShowYesNo(
-                std::format("Save Migration: Disable asking again for this Snapshot?\n\n"
-                            "Other snapshots are still offered. Remove it from "
-                            "sDeclinedSnapshots in the mod's {} file to be offered this one "
-                            "again.",
-                            Config::MigrationConfig::kIniFileName),
-                [snapshotId](unsigned int choice) {
-                    if (choice != 0) {
-                        return;
-                    }
-                    // In the INI, not the co-save: this decision has to survive
-                    // starting an entirely new game, which has no co-save to
-                    // read. Per-snapshot, because that is what the question
-                    // promised - and because making a *new* export is a
-                    // deliberate act of wanting to migrate, which should still
-                    // be offered.
-                    Config::MigrationConfig::DeclineSnapshot(snapshotId);
-                });
-        },
-        PromptGate::kFollowUpDelayMs);
 }
 
 }  // namespace SaveMigration::Core

@@ -12,9 +12,10 @@ enum class StateFlag : uint32_t {
     /// A restore has completed against this save line. This is the *only*
     /// suppressor for "never runs twice".
     kRestoreApplied = 1u << 1,
-    /// The user said No. Cleared by starting another new game, because the flag
-    /// lives in the co-save and a new game has none.
-    kRestoreDeclined = 1u << 2,
+    // 1u << 2 was kRestoreDeclined, set by a load-time prompt that no longer
+    // exists. The bit is deliberately not reused: co-saves written by earlier
+    // builds still carry it, and giving it a new meaning would make those saves
+    // assert something they never said.
     /// A restore was in flight when the game was saved — used to avoid
     /// snapshotting a half-restored world.
     kRestoreInProgress = 1u << 3,
@@ -24,9 +25,8 @@ enum class StateFlag : uint32_t {
 ///
 /// The scope of these flags is deliberate. Living in the co-save means they
 /// travel with the save, survive quickload, and are *absent* from a genuinely
-/// pre-restore save — so loading backwards past a restore correctly re-offers
-/// it. "Never ask again" is the one decision that must outlive the save line
-/// entirely, so that one lives in the INI instead.
+/// pre-restore save — so loading backwards past a restore correctly leaves the
+/// save importable again.
 class MigrationState final : public IRecordHandler {
 public:
     static constexpr uint32_t kSignature = MakeSig('S', 'M', 'S', 'T');
@@ -51,9 +51,12 @@ public:
 
     void MarkRestored(std::string snapshotId, float gameTimeDays);
 
-    /// Debug native support: allow the tester to re-offer a restore without
-    /// hand-editing a co-save.
-    void ClearRestoreDecision();
+    /// Make this save line importable again.
+    ///
+    /// `kRestoreApplied` is what stops a snapshot being applied twice, so this is
+    /// the escape hatch for "the import went wrong, let me try again" - reachable
+    /// from the menu's Advanced page rather than by hand-editing a co-save.
+    void ClearAppliedDecision();
 
 private:
     MigrationState() = default;

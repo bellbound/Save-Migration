@@ -147,19 +147,40 @@ std::vector<ScriptVariableInfo> PapyrusVariableInterface::GetScriptVariables(
         return result;
     }
 
-    const auto propertyCount = typeInfo->GetNumProperties();
-    if (auto* properties = typeInfo->GetPropertyIter()) {
-        for (uint32_t i = 0; i < propertyCount; ++i) {
-            if (const char* name = properties[i].name.c_str(); name && *name) {
-                result.push_back({name, properties[i].info.type.TypeAsString(), true});
+    // Walk the type and then its bases. Inherited properties are as writable as
+    // declared ones, and a mod that moves a property onto a shared base script
+    // between releases would otherwise read as "the property is gone".
+    for (auto* type = typeInfo.get(); type; type = type->GetParent()) {
+        // Every GetXIter() computes an offset into `data`, which only holds the
+        // table blob once the type is linked - before that it is an
+        // UnlinkedNativeFunction list head. Reading the tables off an unlinked
+        // type hands back arbitrary bytes as BSFixedString, and dereferencing
+        // those is an access violation, not an empty result.
+        if (!type->IsLinked()) {
+            spdlog::warn("PapyrusVariableInterface: script type '{}' is not linked; its variables "
+                         "cannot be enumerated, so every write against '{}' will be refused",
+                         type->GetName() ? type->GetName() : scriptName.c_str(), scriptName);
+            break;
+        }
+
+        const auto propertyCount = type->GetNumProperties();
+        if (const auto* properties = type->GetPropertyIter()) {
+            for (uint32_t i = 0; i < propertyCount; ++i) {
+                if (const char* name = properties[i].name.c_str(); name && *name) {
+                    result.push_back({name, properties[i].info.type.TypeAsString(), true});
+                }
             }
         }
-    }
-    const auto variableCount = typeInfo->GetTotalNumVariables();
-    if (auto* variables = typeInfo->GetVariableIter()) {
-        for (uint32_t i = 0; i < variableCount; ++i) {
-            if (const char* name = variables[i].name.c_str(); name && *name) {
-                result.push_back({name, variables[i].type.TypeAsString(), false});
+        // GetNumVariables(), *not* GetTotalNumVariables(): the total counts the
+        // whole inheritance chain, but GetVariableIter() points at this type's own
+        // array only - the entries past it are the initial-value and property
+        // tables. The parents' variables are reached by the loop instead.
+        const auto variableCount = type->GetNumVariables();
+        if (const auto* variables = type->GetVariableIter()) {
+            for (uint32_t i = 0; i < variableCount; ++i) {
+                if (const char* name = variables[i].name.c_str(); name && *name) {
+                    result.push_back({name, variables[i].type.TypeAsString(), false});
+                }
             }
         }
     }

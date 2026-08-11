@@ -1,8 +1,9 @@
 #include "store/SnapshotReader.h"
 
+#include <algorithm>
 #include <format>
+#include <system_error>
 
-#include "config/MigrationConfig.h"
 #include "store/SnapshotPaths.h"
 #include "util/FileUtil.h"
 #include "util/StringUtil.h"
@@ -39,6 +40,35 @@ std::optional<SnapshotSummary> SnapshotReader::ReadSummary(const fs::path& snaps
     summary.schemaVersion = manifest.value("schemaVersion", 0u);
     summary.takenAtUnixMs = manifest.value("takenAtUnixMs", int64_t{0});
     summary.layoutSuspect = manifest.value("layoutSuspect", false);
+    summary.gameRuntime = manifest.value("gameRuntime", "");
+    summary.automatic = manifest.value("auto", false);
+
+    // Derived from the path rather than passed in by the caller, so `ListAll`
+    // and `FindById` cannot end up disagreeing about the same directory.
+    summary.fromLibrary = snapshotDir.parent_path() == SnapshotPaths::SnapshotsRoot();
+
+    // The manifest's category index is authoritative about what the export
+    // meant to write, which is why the counts come from it rather than from
+    // counting files on disk.
+    if (const auto categories = manifest.find("categories");
+        categories != manifest.end() && categories->is_object()) {
+        for (const auto& entry : *categories) {
+            if (entry.value("status", "") == "failed") {
+                ++summary.failedCount;
+            } else {
+                ++summary.categoryCount;
+            }
+        }
+    }
+
+    // Two stats rather than a payload parse. `DirectorySize` walks the tree
+    // with `file_size` only - no reads - so a snapshot carrying a
+    // several-hundred-megabyte SkyrimNet database still costs a handful of
+    // stat calls.
+    summary.bytesOnDisk = Util::DirectorySize(snapshotDir);
+    const auto netDir = SnapshotPaths::SkyrimNetDir(snapshotDir);
+    std::error_code ec;
+    summary.hasSkyrimNetDb = fs::exists(netDir, ec) && !fs::is_empty(netDir, ec);
 
     const auto source = manifest.find("source");
     if (source == manifest.end() || !source->is_object()) {
@@ -57,19 +87,82 @@ std::optional<SnapshotSummary> SnapshotReader::ReadSummary(const fs::path& snaps
 
 std::vector<SnapshotSummary> SnapshotReader::ListAll() {
     std::vector<SnapshotSummary> result;
-    for (const auto& dir : Util::ListSubdirectories(SnapshotPaths::SnapshotsRoot())) {
-        if (SnapshotPaths::IsReservedDirName(dir.filename().string())) {
+    // Case-insensitive, because these are Windows directory names and the two
+    // roots are written by different code paths at different times.
+    std::vector<std::string> seen;
+
+    const auto scan = [&result, &seen](const fs::path& root, bool fromLibrary) {
+        for (const auto& dir : Util::ListSubdirectories(root)) {
+            const auto name = Util::PathToUtf8String(dir.filename());
+            if (SnapshotPaths::IsReservedDirName(name)) {
+                continue;
+            }
+            // The library wins. It is scanned first, so a name already seen is
+            // by construction the library's copy - and when `LibraryRoot()` has
+            // fallen back to the game folder the two roots are literally the
+            // same directory, which this also collapses.
+            if (std::any_of(seen.begin(), seen.end(),
+                            [&name](const std::string& s) { return Util::IEquals(s, name); })) {
+                continue;
+            }
+            seen.push_back(name);
+
+            if (auto summary = ReadSummary(dir)) {
+                result.push_back(std::move(*summary));
+            } else {
+                // Still reported. A snapshot whose manifest will not parse is
+                // something the player needs to see in the list, not something
+                // that silently is not there.
+                SnapshotSummary unreadable;
+                unreadable.dir = dir;
+                unreadable.fromLibrary = fromLibrary;
+                result.push_back(std::move(unreadable));
+            }
+        }
+    };
+
+    scan(SnapshotPaths::SnapshotsRoot(), true);
+    scan(SnapshotPaths::DataSnapshotsRoot(), false);
+    return result;
+}
+
+std::optional<SnapshotSummary> SnapshotReader::FindById(std::string_view dirName) {
+    if (dirName.empty()) {
+        return std::nullopt;
+    }
+    // Rejected before it is turned into a path. The id reaching here came out of
+    // an INI value, so it is not necessarily one this build wrote, and anything
+    // with a separator in it would address a directory outside both roots.
+    if (SnapshotPaths::IsReservedDirName(dirName) ||
+        dirName.find_first_of("/\\:") != std::string_view::npos || dirName == "." ||
+        dirName == "..") {
+        spdlog::warn("SnapshotReader: '{}' is not a usable snapshot name", dirName);
+        return std::nullopt;
+    }
+
+    // The two candidate paths directly rather than a walk of both roots: this is
+    // called to validate a selection, and `ListAll` costs a `DirectorySize` for
+    // every snapshot on the machine. Library first, for the same reason it wins
+    // there.
+    for (const auto& root : {SnapshotPaths::SnapshotsRoot(), SnapshotPaths::DataSnapshotsRoot()}) {
+        const auto dir = root / dirName;
+        std::error_code ec;
+        if (!fs::is_directory(dir, ec)) {
             continue;
         }
         if (auto summary = ReadSummary(dir)) {
-            result.push_back(std::move(*summary));
-        } else {
-            SnapshotSummary unreadable;
-            unreadable.dir = dir;
-            result.push_back(std::move(unreadable));
+            return summary;
         }
+        // The directory is there but its manifest will not parse. Reported as
+        // found-but-unreadable rather than not-found, so a caller can say which
+        // of the two it is.
+        SnapshotSummary unreadable;
+        unreadable.dir = dir;
+        unreadable.fromLibrary = root == SnapshotPaths::SnapshotsRoot();
+        return unreadable;
     }
-    return result;
+    spdlog::warn("SnapshotReader: no snapshot named '{}' in either root", dirName);
+    return std::nullopt;
 }
 
 std::optional<SnapshotSummary> SnapshotReader::SelectNewest(std::string_view excludeSaveId) {
@@ -85,14 +178,6 @@ std::optional<SnapshotSummary> SnapshotReader::SelectNewest(std::string_view exc
         if (!excludeSaveId.empty() && Util::IEquals(summary.saveId, excludeSaveId)) {
             spdlog::debug("SnapshotReader: excluding snapshot from the current save line ({})",
                           summary.saveId);
-            continue;
-        }
-        // The directory name is the snapshot id everywhere else - the co-save
-        // breadcrumb, the restore receipt - so it is what the declined list
-        // holds too.
-        const auto snapshotId = Util::PathToUtf8String(summary.dir.filename());
-        if (Config::MigrationConfig::IsSnapshotDeclined(snapshotId)) {
-            spdlog::info("SnapshotReader: skipping '{}' - declined for good in the INI", snapshotId);
             continue;
         }
         if (!best || summary.takenAtUnixMs > best->takenAtUnixMs) {
@@ -129,11 +214,17 @@ SnapshotReader::LoadResult SnapshotReader::Load(const fs::path& snapshotDir) {
     }
 
     auto& doc = result.doc;
+    // Set before anything else can want it: the side-car categories read it on
+    // the apply side to find their own copies, and they used to re-derive the
+    // directory from `saveId + characterName` - which stopped being sound once
+    // automatic snapshots got names those two do not determine.
+    doc.snapshotDir = snapshotDir;
     doc.manifestSchemaVersion = schemaVersion;
     doc.takenAtUnixMs = manifest.value("takenAtUnixMs", int64_t{0});
     doc.pluginVersion = manifest.value("pluginVersion", "");
     doc.gameRuntime = manifest.value("gameRuntime", "");
     doc.layoutSuspect = manifest.value("layoutSuspect", false) ? 1u : 0u;
+    doc.automatic = manifest.value("auto", false) ? 1u : 0u;
     doc.diagnostics = manifest.value("diagnostics", nlohmann::json::object());
 
     if (const auto source = manifest.find("source"); source != manifest.end()) {

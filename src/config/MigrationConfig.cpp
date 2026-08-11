@@ -25,36 +25,58 @@ std::unordered_set<std::string>& KnownImportIds() {
     return ids;
 }
 
+/// The same, for `[Exports]`.
+std::unordered_set<std::string>& KnownExportIds() {
+    static std::unordered_set<std::string> ids;
+    return ids;
+}
+
+/// `player.map_markers` -> `PlayerMapMarkers`. Both separators the ids use - the
+/// dot between namespace and name, the underscore inside a name - start a new
+/// word; everything else is copied through lowercased.
+std::string CamelName(std::string_view categoryId) {
+    std::string name;
+    name.reserve(categoryId.size() + 1);
+    bool upper = true;
+    for (const char c : categoryId) {
+        if (c == '.' || c == '_') {
+            upper = true;
+            continue;
+        }
+        name.push_back(upper ? static_cast<char>(std::toupper(static_cast<unsigned char>(c)))
+                             : static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+        upper = false;
+    }
+    return name;
+}
+
 }  // namespace
 
 void MigrationConfig::Initialize() {
     auto* storage = Storage();
     storage->Initialize(kModName, kIniFileName);
 
-    storage->RegisterIntOption(Keys::kSnapshot, 0);
+    storage->RegisterIntOption(Keys::kAutoExportOnSave, 0);
+    storage->RegisterIntOption(Keys::kAutoExportEverySaves, 10);
+    storage->RegisterIntOption(Keys::kKeepAutoExports, 5);
 
-    storage->RegisterIntOption(Keys::kAskBeforeExport, 1);
     storage->RegisterIntOption(Keys::kMinSnapshotIntervalSec, 120);
     storage->RegisterIntOption(Keys::kIncludeSkyrimNetDb, 1);
     storage->RegisterIntOption(Keys::kMaxSideCarMb, 2048);
     storage->RegisterIntOption(Keys::kVmReadyTimeoutSec, 120);
     storage->RegisterIntOption(Keys::kVmSettleDelayMs, 3000);
 
-    storage->RegisterIntOption(Keys::kAskBeforeImport, 1);
-    storage->RegisterStringOption(Keys::kDeclinedSnapshots, "");
+    storage->RegisterStringOption(Keys::kSelectedSnapshot, "");
     storage->RegisterIntOption(Keys::kMaxLevelForRestore, 3);
-    storage->RegisterIntOption(Keys::kPromptDelayMs, 3000);
     storage->RegisterIntOption(Keys::kValidateAfterImport, 1);
     storage->RegisterIntOption(Keys::kProgressNotifyIntervalSec, 5);
     storage->RegisterIntOption(Keys::kReconstructCraftedItems, 1);
     storage->RegisterIntOption(Keys::kRestoreQuestItems, 0);
     storage->RegisterIntOption(Keys::kRestoreName, 0);
-    storage->RegisterIntOption(Keys::kGameTimeMode, 1);
+    storage->RegisterIntOption(Keys::kGameTimeMode, 0);
     storage->RegisterIntOption(Keys::kKillToMatch, 0);
-    storage->RegisterIntOption(Keys::kKillToMatchIUnderstand, 0);
     storage->RegisterIntOption(Keys::kAllowLoverRank, 0);
     storage->RegisterIntOption(Keys::kRestoreQuestPerks, 0);
-    storage->RegisterIntOption(Keys::kRestoreModUtilitySpells, 0);
     storage->RegisterIntOption(Keys::kRestoreVrEditorConfig, 0);
     storage->RegisterStringOption(Keys::kDisabledCategories, "");
     storage->RegisterStringOption(Keys::kPluginAliases, "");
@@ -66,23 +88,23 @@ void MigrationConfig::Initialize() {
     storage->RegisterIntOption(Keys::kVerifySkillMirror, 1);
     storage->RegisterIntOption(Keys::kVerifyMapMarkerPersistence, 0);
 
-    spdlog::info("MigrationConfig: mode={}, ini={}", IsSnapshotMode() ? "SNAPSHOT" : "RESTORE",
+    spdlog::info("MigrationConfig: autoExportOnSave={} (every {} save(s), keeping {}), ini={}",
+                 AutoExportOnSave(), AutoExportEverySaves(), KeepAutoExports(),
                  storage->GetIniPath());
 }
 
-bool MigrationConfig::IsSnapshotMode() { return GetBool(Keys::kSnapshot, false); }
+bool MigrationConfig::AutoExportOnSave() { return GetBool(Keys::kAutoExportOnSave, false); }
 
-void MigrationConfig::SetSnapshotMode(bool value) {
-    Storage()->SetInt(Keys::kSnapshot, value ? 1 : 0);
-    spdlog::info("MigrationConfig: bSnapshot set to {} - the plugin is now in {} mode",
-                 value ? 1 : 0, value ? "SNAPSHOT" : "RESTORE");
+int MigrationConfig::AutoExportEverySaves() {
+    // Floor of 1 - "every 0th save" has no meaning, and a modulo by zero would
+    // be a crash rather than a misconfiguration.
+    return std::clamp(Storage()->GetInt(Keys::kAutoExportEverySaves, 10), 1, 100);
 }
 
-bool MigrationConfig::AskBeforeExport() { return GetBool(Keys::kAskBeforeExport, true); }
-
-void MigrationConfig::SetAskBeforeExport(bool value) {
-    Storage()->SetInt(Keys::kAskBeforeExport, value ? 1 : 0);
-    spdlog::info("MigrationConfig: bAskBeforeExport set to {}", value ? 1 : 0);
+int MigrationConfig::KeepAutoExports() {
+    // Floor of 1: switching automatic exports on and keeping none of them is a
+    // setting that spends disk and time to produce nothing.
+    return std::clamp(Storage()->GetInt(Keys::kKeepAutoExports, 5), 1, 50);
 }
 
 int MigrationConfig::MinSnapshotIntervalSec() {
@@ -103,66 +125,18 @@ int MigrationConfig::VmSettleDelayMs() {
     return std::clamp(Storage()->GetInt(Keys::kVmSettleDelayMs, 3000), 0, 60000);
 }
 
-bool MigrationConfig::AskBeforeImport() { return GetBool(Keys::kAskBeforeImport, true); }
-
-void MigrationConfig::SetAskBeforeImport(bool value) {
-    Storage()->SetInt(Keys::kAskBeforeImport, value ? 1 : 0);
-    // In the INI rather than the co-save on purpose: this decision has to survive
-    // starting an entirely new game, and a new game has no co-save to read.
-    spdlog::info("MigrationConfig: bAskBeforeImport set to {} (persists across new games)",
-                 value ? 1 : 0);
+std::string MigrationConfig::SelectedSnapshot() {
+    return Storage()->GetString(Keys::kSelectedSnapshot, "");
 }
 
-std::vector<std::string> MigrationConfig::DeclinedSnapshots() {
-    return Util::SplitAndTrim(Storage()->GetString(Keys::kDeclinedSnapshots, ""), ',');
-}
-
-void MigrationConfig::DeclineSnapshot(std::string_view snapshotId) {
-    if (snapshotId.empty()) {
-        return;
-    }
-    auto declined = DeclinedSnapshots();
-    if (std::find(declined.begin(), declined.end(), snapshotId) != declined.end()) {
-        return;
-    }
-    declined.emplace_back(snapshotId);
-
-    // Bounded, newest kept. Snapshot ids are long, the value is one INI line,
-    // and a list nobody prunes eventually becomes a line nobody can read.
-    constexpr size_t kMaxRemembered = 32;
-    if (declined.size() > kMaxRemembered) {
-        declined.erase(declined.begin(), declined.end() - kMaxRemembered);
-    }
-
-    std::string joined;
-    for (const auto& id : declined) {
-        if (!joined.empty()) {
-            joined += ", ";
-        }
-        joined += id;
-    }
-    Storage()->SetString(Keys::kDeclinedSnapshots, joined);
-    spdlog::info("MigrationConfig: snapshot '{}' will not be offered again", snapshotId);
-}
-
-bool MigrationConfig::IsSnapshotDeclined(std::string_view snapshotId) {
-    if (snapshotId.empty()) {
-        return false;
-    }
-    for (const auto& id : DeclinedSnapshots()) {
-        if (Util::IEquals(id, snapshotId)) {
-            return true;
-        }
-    }
-    return false;
+void MigrationConfig::SetSelectedSnapshot(std::string_view snapshotId) {
+    Storage()->SetString(Keys::kSelectedSnapshot, snapshotId);
+    spdlog::info("MigrationConfig: selected snapshot is now '{}'",
+                 snapshotId.empty() ? "(none)" : snapshotId);
 }
 
 int MigrationConfig::MaxLevelForRestore() {
     return std::max(1, Storage()->GetInt(Keys::kMaxLevelForRestore, 3));
-}
-
-int MigrationConfig::PromptDelayMs() {
-    return std::clamp(Storage()->GetInt(Keys::kPromptDelayMs, 3000), 0, 60000);
 }
 
 bool MigrationConfig::ValidateAfterImport() { return GetBool(Keys::kValidateAfterImport, true); }
@@ -183,25 +157,19 @@ bool MigrationConfig::RestoreQuestItems() { return GetBool(Keys::kRestoreQuestIt
 bool MigrationConfig::RestoreName() { return GetBool(Keys::kRestoreName, false); }
 
 int MigrationConfig::GameTimeMode() {
-    return std::clamp(Storage()->GetInt(Keys::kGameTimeMode, 1), 0, 2);
+    const auto mode = std::clamp(Storage()->GetInt(Keys::kGameTimeMode, 0), 0, 2);
+    // Mode 1 was the cosmetic date-and-hour restore, and it is gone - see the
+    // declaration. Folded onto 0 rather than onto 2, because the safe reading of
+    // a mode that no longer exists is "leave the clock alone", and a file left
+    // over from an older build says 1 by default.
+    return mode == 1 ? 0 : mode;
 }
 
 bool MigrationConfig::KillToMatch() { return GetBool(Keys::kKillToMatch, false); }
 
-bool MigrationConfig::KillToMatchAcknowledged() {
-    // Deliberately requires *both* keys. Killing NPCs to match a snapshot
-    // breaks quest aliases irrecoverably, so a single stray toggle must not
-    // arm it.
-    return GetBool(Keys::kKillToMatch, false) && GetBool(Keys::kKillToMatchIUnderstand, false);
-}
-
 bool MigrationConfig::AllowLoverRank() { return GetBool(Keys::kAllowLoverRank, false); }
 
 bool MigrationConfig::RestoreQuestPerks() { return GetBool(Keys::kRestoreQuestPerks, false); }
-
-bool MigrationConfig::RestoreModUtilitySpells() {
-    return GetBool(Keys::kRestoreModUtilitySpells, false);
-}
 
 bool MigrationConfig::RestoreVrEditorConfig() {
     return GetBool(Keys::kRestoreVrEditorConfig, false);
@@ -232,22 +200,41 @@ bool MigrationConfig::VerifyMapMarkerPersistence() {
 }
 
 std::string MigrationConfig::ImportKeyFor(std::string_view categoryId) {
-    // `player.map_markers` -> `Imports:bPlayerMapMarkers`. Both separators the
-    // ids use - the dot between namespace and name, the underscore inside a name
-    // - start a new word; everything else is copied through lowercased.
-    std::string name;
-    name.reserve(categoryId.size() + 1);
-    bool upper = true;
-    for (const char c : categoryId) {
-        if (c == '.' || c == '_') {
-            upper = true;
-            continue;
-        }
-        name.push_back(upper ? static_cast<char>(std::toupper(static_cast<unsigned char>(c)))
-                             : static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
-        upper = false;
-    }
-    return std::string("Imports:b") + name;
+    return std::string("Imports:b") + CamelName(categoryId);
+}
+
+std::string MigrationConfig::ExportKeyFor(std::string_view categoryId) {
+    return std::string("Exports:b") + CamelName(categoryId);
+}
+
+bool MigrationConfig::ExportDefaultsToOff(std::string_view categoryId) {
+    // A list rather than a flag on `CategoryDescriptor`, deliberately: it is a
+    // statement about what ships switched off, not about what the category *is*.
+    // One place to look, so this and the registration calls below cannot drift.
+    return categoryId == "world.stored_containers" ||
+           // Deciding which preset the player made means seeing through Mod
+           // Organizer's file system, one `GetFinalPathNameByHandleW` per file, and
+           // reading "not redirected, or redirected somewhere that is not a mod"
+           // as authorship. That inference is the experimental part; a wrong call
+           // in the generous direction writes a preset pack's content into
+           // overwrite, where it shadows the mod that provides it. Whole-mod
+           // preset migration under `mods.` is the deliberate, non-guessing route
+           // and is on by default instead.
+           categoryId == "system.racemenu_presets";
+}
+
+bool MigrationConfig::ImportDefaultsToOff(std::string_view categoryId) {
+    // Separate from the export side because the two questions are different. "Do
+    // not spend two megabytes of every snapshot on this" is not the same statement
+    // as "do not write this into my game", and a category can warrant one without
+    // the other - `system.racemenu_presets` does: exporting it rests on an
+    // inference, while writing back presets a snapshot already contains does not.
+    return categoryId == "world.stored_containers" ||
+           // The whole-mod migrations. Exporting a preset library costs disk in a
+           // folder the user chose to fill; importing one writes hundreds of files
+           // into overwrite, where they shadow whichever installed mod provides the
+           // same name. That is a thing to ask for, so it ships off.
+           categoryId.starts_with("mods.");
 }
 
 void MigrationConfig::RegisterImportToggles(const std::vector<std::string>& categoryIds) {
@@ -255,12 +242,25 @@ void MigrationConfig::RegisterImportToggles(const std::vector<std::string>& cate
     auto& known = KnownImportIds();
     known.clear();
     for (const auto& id : categoryIds) {
-        // Default on. A user who has never opened the INI must get the whole
-        // snapshot, not a subset that depends on which build wrote the file.
-        storage->RegisterIntOption(ImportKeyFor(id), 1);
+        // Default on, apart from the opt-in list. A user who has never opened
+        // the INI must get the whole snapshot, not a subset that depends on
+        // which build wrote the file.
+        storage->RegisterIntOption(ImportKeyFor(id), ImportDefaultsToOff(id) ? 0 : 1);
         known.insert(id);
     }
     spdlog::info("MigrationConfig: {} import toggle(s) registered under [Imports]",
+                 categoryIds.size());
+}
+
+void MigrationConfig::RegisterExportToggles(const std::vector<std::string>& categoryIds) {
+    auto* storage = Storage();
+    auto& known = KnownExportIds();
+    known.clear();
+    for (const auto& id : categoryIds) {
+        storage->RegisterIntOption(ExportKeyFor(id), ExportDefaultsToOff(id) ? 0 : 1);
+        known.insert(id);
+    }
+    spdlog::info("MigrationConfig: {} export toggle(s) registered under [Exports]",
                  categoryIds.size());
 }
 
@@ -271,7 +271,14 @@ bool MigrationConfig::IsImportEnabled(std::string_view categoryId) {
         // drops data the user asked to migrate.
         return true;
     }
-    return GetBool(ImportKeyFor(categoryId), true);
+    return GetBool(ImportKeyFor(categoryId), !ImportDefaultsToOff(categoryId));
+}
+
+bool MigrationConfig::IsExportEnabled(std::string_view categoryId) {
+    if (!KnownExportIds().contains(std::string(categoryId))) {
+        return true;
+    }
+    return GetBool(ExportKeyFor(categoryId), !ExportDefaultsToOff(categoryId));
 }
 
 void MigrationConfig::SetLastRestoreBreadcrumb(std::string_view snapshotId) {

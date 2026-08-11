@@ -21,7 +21,21 @@ public:
     static SnapshotOrchestrator& Get();
 
     /// Evaluate every snapshot gate. `reasonOut` explains a refusal, for the log.
+    ///
+    /// World state only - "is there anything coherent here worth recording". It
+    /// does not consult `bAutoExportOnSave`: that setting answers whether a *save*
+    /// should harvest unasked, which is a different question and belongs to the
+    /// caller.
     [[nodiscard]] bool ShouldTake(std::string& reasonOut);
+
+    /// Mark the next harvest as automatic, i.e. taken by `bAutoExportOnSave`
+    /// rather than asked for from the menu.
+    ///
+    /// Set before `Take`/`ForceTake` and consumed by the harvest. It decides three
+    /// things: which directory the snapshot gets, whether the manifest says
+    /// `auto`, and whether the completion handler is allowed to put a
+    /// notification on screen for a success.
+    void MarkNextAsAutomatic();
 
     /// Wait for the Papyrus VM, then harvest. Call only after `ShouldTake`
     /// returned true.
@@ -46,6 +60,11 @@ public:
         std::string snapshotId;
         uint32_t categoriesWritten = 0;
         uint32_t categoriesFailed = 0;
+        /// True when `bAutoExportOnSave` took this one. A successful automatic
+        /// export is silent; a failed one is not, whoever asked for it.
+        bool automatic = false;
+        /// Old automatic snapshots deleted after this one, for the log.
+        uint32_t prunedCount = 0;
     };
 
     /// Run once on the game thread when the snapshot has been written, then
@@ -56,7 +75,16 @@ public:
     /// is how `LifecycleController` gets to say so.
     void SetCompletionHandler(std::function<void(const CompletionInfo&)> handler);
 
-    /// Debug native support: bypass the gates for a manual snapshot.
+    /// Bypass the gates for a snapshot the player asked for by name - the MCM's
+    /// export button, or the debug native.
+    ///
+    /// **Also skips the VM wait**, and that is not an optimisation. Both callers
+    /// are Papyrus natives, so the VM is demonstrably answering: it is what made
+    /// the call. The wait exists for `kPostLoadGame`, where the VM may still be
+    /// suspended - and its readiness probe treats menu mode as "not ready", which
+    /// the MCM *always* is. Left in the path, an export started from the menu sits
+    /// at "Working..." for the whole `iVmReadyTimeoutSec` and then harvests with
+    /// its VM-sourced categories marked suspect.
     void ForceTake(std::string_view savePath);
 
     /// Integrations contribute roster members here before the harvest runs, so
@@ -86,9 +114,35 @@ private:
 
     void RunHarvest(std::string savePath);
 
+    /// Fire the one-shot completion handler with a failure, for a harvest that
+    /// was abandoned before it could produce one.
+    ///
+    /// Deliberately does *not* touch `m_inFlight` - the caller is the only one
+    /// who knows whether it owns the flight it is abandoning. Every abandoned
+    /// harvest has to come through here: `McmExportStatus` latches on "running"
+    /// until something reports, and a latch that never clears leaves the menu's
+    /// export button dead for the rest of the session.
+    ///
+    /// `automatic` is passed rather than read off `m_automatic`, because the one
+    /// caller that refuses a *request* - "a snapshot is already in flight" - is
+    /// describing the request it turned away, while `m_automatic` describes the
+    /// harvest that is running. Those are two different exports.
+    void ReportFailure(std::string error, bool automatic);
+
     static constexpr uint32_t kVmProbeIntervalMs = 1000;
 
     std::atomic<bool> m_inFlight{false};
+    /// Set by `ForceTake` and consumed by `Take`. Atomic because `ForceTake` is
+    /// reachable straight off the VM thread, while `Take`'s consumer runs on the
+    /// game thread.
+    std::atomic<bool> m_skipVmWait{false};
+    /// Set by `MarkNextAsAutomatic` and consumed by `Take`, for the same reason
+    /// and with the same lifetime as `m_skipVmWait`.
+    std::atomic<bool> m_nextIsAutomatic{false};
+    /// Whether the harvest now running is automatic. Game thread only, latched
+    /// out of `m_nextIsAutomatic` at the point the flight is claimed, so a request
+    /// arriving mid-harvest cannot change what the running one is.
+    bool m_automatic = false;
     /// One-shot, cleared as it fires. Game thread only.
     std::function<void(const CompletionInfo&)> m_onComplete;
     /// Guards the transition out of the wait. Game thread only, but the probe

@@ -37,11 +37,21 @@ public:
 
     RE::BSScript::Internal::VirtualMachine* GetVM();
 
-    /// True when `scriptName` declares a global function called `functionName`.
+    /// True when `scriptName` declares a global function called `functionName`
+    /// that can accept `argCount` arguments.
+    ///
     /// Every CallGlobalFunction* checks this first: dispatching a function the
     /// script does not declare crashes inside the VM rather than failing cleanly.
-    /// Answers are cached, so the type table is walked once per name.
-    bool HasGlobalFunction(const std::string& scriptName, const std::string& functionName);
+    /// Answers are cached, so the type table is walked once per name+arity.
+    bool HasGlobalFunction(const std::string& scriptName, const std::string& functionName,
+                           std::size_t argCount);
+
+    /// The method equivalent, walking the script's member-function table and then
+    /// its parents'. Same reasoning as `HasGlobalFunction`: the VM is no kinder
+    /// about a missing member function than about a missing global one, and a
+    /// third-party script is free to rename `SetFollowerHome` in its next release.
+    bool HasMethod(const std::string& scriptName, const std::string& functionName,
+                   std::size_t argCount);
 
     // ── Static (global) calls ─────────────────────────────────────────────
     bool CallGlobalFunction(const std::string& scriptName, const std::string& functionName,
@@ -112,10 +122,18 @@ private:
     PapyrusInterface(const PapyrusInterface&) = delete;
     PapyrusInterface& operator=(const PapyrusInterface&) = delete;
 
-    /// "Script::Function" -> declared. Guarded because categories collect from the
+    /// "Script::Function/argc" -> callable. Globals and methods live in the same
+    /// map under different key shapes. Guarded because categories collect from the
     /// worker as well as the game thread.
     std::unordered_map<std::string, bool> m_functionCache;
     std::mutex m_functionCacheMutex;
+
+    /// Shared body of `HasGlobalFunction` and `HasMethod`.
+    ///
+    /// `walkParents` is the only difference in behaviour: a global function is
+    /// declared on exactly one script, a member function is inherited.
+    bool HasFunction(const std::string& scriptName, const std::string& functionName,
+                     std::size_t argCount, bool memberFunctions, bool walkParents);
 
     void PackForm(RE::BSScript::Variable& var, RE::TESForm* form, const char* className);
     RE::BSTSmartPointer<RE::BSScript::Array> CreateActorArray(const std::vector<RE::Actor*>& actors);

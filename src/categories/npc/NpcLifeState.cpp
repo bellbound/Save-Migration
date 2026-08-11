@@ -107,13 +107,13 @@ void NpcLifeState::ApplyActor(const Model::ActorSubject& subject, Core::ApplyCon
         return;
     }
 
-    // wasDead == true. Killing to match is off unless *both* keys are set.
-    if (!Config::MigrationConfig::KillToMatchAcknowledged()) {
+    // wasDead == true, and killing to match is opt-in.
+    if (!Config::MigrationConfig::KillToMatch()) {
         ctx.report.SkippedItem(
             subjectRef, itemId, Report::ReasonCode::kSubjectDead,
             std::format("'{}' was dead in the snapshot. Nothing was done: killing them here would "
-                        "break any quest alias holding them, which cannot be undone. Set both "
-                        "bKillToMatch=1 and bKillToMatchIUnderstand=1 if you really want this.",
+                        "break any quest alias holding them, which cannot be undone. Set "
+                        "bKillToMatch=1 if you really want this.",
                         subject.displayName),
             subject.displayName);
         return;
@@ -125,7 +125,7 @@ void NpcLifeState::ApplyActor(const Model::ActorSubject& subject, Core::ApplyCon
         return;
     }
 
-    // Hard skips, regardless of the acknowledgement.
+    // Hard skips, regardless of bKillToMatch.
     if (subject.actor->IsEssential() || subject.actor->IsProtected()) {
         ctx.report.SkippedItem(subjectRef, itemId, Report::ReasonCode::kSubjectDead,
                                std::format("'{}' is essential or protected, so they were not killed "

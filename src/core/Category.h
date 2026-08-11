@@ -228,10 +228,25 @@ public:
     [[nodiscard]] virtual const CategoryDescriptor& Describe() const = 0;
     [[nodiscard]] virtual bool IsAvailable() const;
 
-    /// See `IGlobalCategory::PrepareCollect`. Only the player is passed: the
-    /// roster does not exist yet at prime time, and it is deliberately built
-    /// inside the harvest so it describes one instant.
-    virtual void PrepareCollect(RE::PlayerCharacter*) {}
+    /// See `IGlobalCategory::PrepareCollect`.
+    ///
+    /// `roster` is a *prime-time* roster, built specially for this call. It is
+    /// deliberately **not** the one the harvest walks: that one is still built
+    /// inside the harvest, so it continues to describe a single instant. This one
+    /// exists only so a category can dispatch one Papyrus read per actor and have
+    /// the answers land during `iVmSettleDelayMs`.
+    ///
+    /// The two can therefore disagree - an actor who becomes a follower during
+    /// the settle delay is in the harvest roster but not this one. A category must
+    /// treat a missing primed answer as "not captured" rather than as "empty",
+    /// which is the same discipline it needs for a VM that simply did not reply
+    /// in time.
+    ///
+    /// Without this, per-actor reads of another mod are impossible to do
+    /// correctly: dispatching from `CollectActor` cannot work, because the whole
+    /// harvest is one game-thread task and the answer arrives after the document
+    /// has been written.
+    virtual void PrepareCollect(RE::PlayerCharacter*, const std::vector<Model::ActorSubject>&) {}
 
     /// Per-category setup before the roster walk (cache handles, resolve quests).
     virtual void BeginCollect(CollectContext&) {}

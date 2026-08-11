@@ -12,7 +12,7 @@ constexpr std::string_view kId = "player.game_clock";
 
 /// Writing a TESGlobal directly rather than via Papyrus: SetValue on a global
 /// does not fire the change notifications that a `GameDaysPassed` jump would,
-/// which is precisely why mode 2 is dangerous and mode 1 is not.
+/// which is precisely why mode 2 is the dangerous one.
 void SetGlobal(RE::TESGlobal* global, float value) {
     if (global) {
         global->value = value;
@@ -106,8 +106,10 @@ void GameClock::Apply(Core::ApplyContext& ctx) {
     // governs *when the character is*, and the timescale is not that.
     ApplyTimescale(ctx, calendar, payload);
 
+    // Two modes, not three. `GameTimeMode` folds the retired cosmetic mode onto
+    // 0, so anything that is not the full jump means "leave the clock alone".
     const int mode = Config::MigrationConfig::GameTimeMode();
-    if (mode == 0) {
+    if (mode != 2) {
         ctx.report.SkipCategory(Report::ReasonCode::kSkippedByIni,
                                 "iGameTimeMode=0, so the date and GameDaysPassed were left "
                                 "untouched; the timescale is applied regardless");
@@ -116,21 +118,7 @@ void GameClock::Apply(Core::ApplyContext& ctx) {
 
     const auto subject = Report::WorldSubject("Calendar");
 
-    if (mode == 1) {
-        // Cosmetic only: the displayed date and hour move, `GameDaysPassed`
-        // does not. Every mod timer keyed off elapsed days stays where it is.
-        SetGlobal(calendar->gameYear, payload.value("year", 0.0f));
-        SetGlobal(calendar->gameMonth, payload.value("month", 0.0f));
-        SetGlobal(calendar->gameDay, payload.value("day", 1.0f));
-        SetGlobal(calendar->gameHour, payload.value("hour", 12.0f));
-        ctx.report.Succeeded(subject, "game_clock_cosmetic", "", "Date and hour");
-        ctx.report.Info(
-            "Cosmetic clock restore: the date and hour match the snapshot, but GameDaysPassed was "
-            "left alone so no mod timer was disturbed.");
-        return;
-    }
-
-    // mode == 2: the full jump. Opt-in, warned, and last.
+    // The full jump. Opt-in, warned, and last.
     const float targetDays = payload.value("daysPassed", 0.0f);
     const float currentDays = calendar->GetDaysPassed();
     if (!std::isfinite(targetDays) || targetDays < 0.0f) {

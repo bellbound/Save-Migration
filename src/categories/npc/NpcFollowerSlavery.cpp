@@ -124,11 +124,10 @@ void NpcFollowerSlavery::EndCollect(Core::CollectContext& ctx) {
         return;
     }
     auto& payload = ctx.Payload(kId, Describe().schemaVersion);
+    // `slaveCount` and nothing else. There was a constant `note` here explaining
+    // how detection works and why the master is not recorded; that belongs in
+    // this file's comments, which already carry it, rather than in every payload.
     payload["slaveCount"] = m_found;
-    payload["note"] =
-        "Detected from the fsm_Slave keyword on each actor reference, which needs no Papyrus call. "
-        "The master is deliberately not recorded: the restore goes through FSM's own "
-        "EnslaveOnLoadGame queue, which takes a master *type* and picks an individual itself.";
 
     if (m_found == 0) {
         ctx.report.Info("no follower in the roster is currently enslaved");

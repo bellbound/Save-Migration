@@ -389,7 +389,8 @@ void DeferredRestoreManager::Drain() {
     }
 
     auto& queue = PendingWorkQueue::Get();
-    auto items = queue.Items();
+    uint64_t generationAtStart = 0;
+    auto items = queue.Items(generationAtStart);
     if (items.empty()) {
         return;
     }
@@ -512,7 +513,10 @@ void DeferredRestoreManager::Drain() {
         survivors.push_back(std::move(item));
     }
 
-    queue.CommitDrain(std::move(survivors), processed);
+    // Not `Replace`: an applier can enqueue while the drain is running, and that
+    // work lives in the live queue rather than in `survivors`, which was built
+    // from a copy taken before the pass began.
+    queue.CommitDrain(std::move(survivors), processed, generationAtStart);
 
     if (deferredRemainder) {
         // Re-arm for the next frame. `matchAll` so the carried-over items are

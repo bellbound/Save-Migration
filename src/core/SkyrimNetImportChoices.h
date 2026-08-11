@@ -22,8 +22,13 @@ public:
         /// Q1. False means the whole SkyrimNet step is skipped.
         bool importData = false;
 
-        /// Q2. Copy `prompts/_saves/<old>` to `prompts/_saves/<new>` - the dynamic bio
-        /// updates and save-specific character bios.
+        /// Q2. Copy `prompts/_saves/<old>` to `prompts/_saves/<new>`.
+        ///
+        /// The **whole** tree, not a subset: `characters/*.prompt` (which includes the
+        /// player's own `player_special.prompt`), `characters/dynamic/`,
+        /// `characters/imgs/` and the timestamped `.backup` files. The copy is a
+        /// recursive directory walk with no filter, so there is one switch and it is
+        /// all-or-nothing.
         bool copyPromptArchive = false;
 
         /// Q3. Rewrite the old character's name in the narrative text. Both names are

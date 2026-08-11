@@ -202,4 +202,66 @@ bool MovePath(const fs::path& from, const fs::path& to) {
     return true;
 }
 
+bool IsContainedRelativePath(const fs::path& relative) {
+    if (relative.empty() || relative.is_absolute() || relative.has_root_name() ||
+        relative.has_root_directory()) {
+        return false;
+    }
+    for (const auto& part : relative) {
+        // `.` is harmless but pointless; `..` is the one that escapes.
+        if (part == "..") {
+            return false;
+        }
+    }
+    return true;
+}
+
+fs::path RealPathOf(const fs::path& path) {
+    // `FILE_FLAG_BACKUP_SEMANTICS` so the same call works on a directory, and a
+    // zero access mask so this never contends with a file another process has open
+    // for writing - which, for another mod's settings file, is the normal case.
+    HANDLE handle = ::CreateFileW(path.c_str(), 0,
+                                  FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                                  OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) {
+        return {};
+    }
+
+    std::wstring buffer(MAX_PATH, L'\0');
+    DWORD length = ::GetFinalPathNameByHandleW(handle, buffer.data(),
+                                               static_cast<DWORD>(buffer.size()),
+                                               FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+    // The first call reports the required size, *including* the terminator, when
+    // the buffer was too small. One retry is enough; a second failure is real.
+    if (length >= buffer.size()) {
+        buffer.resize(length);
+        length = ::GetFinalPathNameByHandleW(handle, buffer.data(),
+                                             static_cast<DWORD>(buffer.size()),
+                                             FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+    }
+    ::CloseHandle(handle);
+
+    if (length == 0 || length >= buffer.size()) {
+        return {};
+    }
+    buffer.resize(length);
+
+    // `VOLUME_NAME_DOS` still returns the `\\?\` extended-length prefix. Left in
+    // place it defeats every subsequent comparison and reads badly in a report.
+    constexpr std::wstring_view kPrefix = LR"(\\?\)";
+    if (buffer.starts_with(kPrefix)) {
+        buffer.erase(0, kPrefix.size());
+    }
+    return fs::path(buffer);
+}
+
+bool IsUnderOverwrite(const fs::path& realPath) {
+    for (const auto& part : realPath) {
+        if (IEquals(PathToUtf8String(part), "overwrite")) {
+            return true;
+        }
+    }
+    return false;
+}
+
 }  // namespace SaveMigration::Util

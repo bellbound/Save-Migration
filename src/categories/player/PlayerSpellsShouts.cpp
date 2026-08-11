@@ -206,7 +206,13 @@ void PlayerSpellsShouts::Apply(Core::ApplyContext& ctx) {
     // ── Spells and abilities ──────────────────────────────────────────────
     uint32_t added = 0;
     uint32_t heldBack = 0;
-    const bool restoreEverything = Config::MigrationConfig::RestoreModUtilitySpells();
+    // No longer a setting. `bRestoreModUtilitySpells=1` restored the spell list
+    // verbatim - passive abilities and the utility powers mods bind their menus
+    // to included - and it was never the right answer: every one of those is
+    // handed out by its own mod as soon as that mod initialises here, so copying
+    // them across told those mods about a state this character has not reached
+    // and produced duplicate menu powers. Provenance decides, always.
+    constexpr bool restoreEverything = false;
     const auto& provenance = Model::SpellProvenance::Get();
 
     const auto addSpellList = [&](const nlohmann::json& list, const char* kind) {
@@ -328,8 +334,7 @@ void PlayerSpellsShouts::Apply(Core::ApplyContext& ctx) {
             "{} entry/entries in the snapshot's spell list were deliberately not re-granted: "
             "passive abilities and mod utility powers. Those are handed out by whatever owns them "
             "as soon as it initialises here, so copying them across would only tell those mods "
-            "about a state this character has not reached. Set bRestoreModUtilitySpells=1 to "
-            "restore the list verbatim instead.",
+            "about a state this character has not reached.",
             heldBack));
     }
 }
@@ -362,8 +367,7 @@ void PlayerSpellsShouts::Validate(Core::ApplyContext& ctx) {
             // A spell the applier declined on purpose is not a spell that failed
             // to stick. Asking the same question the applier asked, rather than
             // reading a flag off the snapshot, keeps the two from drifting apart.
-            if (!Config::MigrationConfig::RestoreModUtilitySpells() &&
-                !Model::SpellProvenance::Get().ShouldRestore(spell, key)) {
+            if (!Model::SpellProvenance::Get().ShouldRestore(spell, key)) {
                 continue;
             }
             ++missingSpells;

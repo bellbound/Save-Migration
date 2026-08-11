@@ -1,5 +1,6 @@
 #pragma once
 
+#include <filesystem>
 #include <nlohmann/json.hpp>
 #include <string>
 #include <tuple>
@@ -49,6 +50,27 @@ struct SnapshotDocument {
     /// Set when the VR layout probe failed, so an importer can distrust
     /// anything that came from an offset-dependent reader.
     uint32_t layoutSuspect = 0;
+    /// 1 when the export was taken automatically by `bAutoExportOnSave` rather
+    /// than asked for from the menu. Automatic snapshots get their own
+    /// directories and are pruned to `iKeepAutoExports`; a hand-made one is
+    /// never deleted, so the menu has to be able to tell them apart.
+    uint32_t automatic = 0;
+
+    // ── Where this document lives ─────────────────────────────────────────
+    /// The directory being written to (export) or read from (import).
+    ///
+    /// Deliberately **not** in `Members()`, so it is never serialised: a snapshot
+    /// must not record its own absolute path, or moving the library would make
+    /// every manifest in it wrong. It is here because the side-car categories -
+    /// RaceMenu, VR Editor, TNG, SkyrimNet - do their file work on the worker
+    /// thread and need the directory. They used to re-derive it from
+    /// `saveId + characterName`, which stopped being sound the moment automatic
+    /// snapshots got a directory name those two do not determine.
+    ///
+    /// An `fs::path` rather than a UTF-8 string on purpose: converting back would
+    /// go through the narrow ACP encoding and mangle a library path under a
+    /// non-ASCII Windows user name.
+    std::filesystem::path snapshotDir;
 
     // ── Payloads ──────────────────────────────────────────────────────────
     /// Per-plugin load order record. Required by the SkyrimNet `form_id` repair
@@ -72,8 +94,8 @@ struct SnapshotDocument {
 
     [[nodiscard]] auto Members() {
         return std::tie(saveId, characterName, savePath, pluginVersion, gameRuntime, takenAtUnixMs,
-                        gameTimeDays, playerLevel, manifestSchemaVersion, layoutSuspect, loadOrder,
-                        categories, roster, actorCategories, diagnostics);
+                        gameTimeDays, playerLevel, manifestSchemaVersion, layoutSuspect, automatic,
+                        loadOrder, categories, roster, actorCategories, diagnostics);
     }
 };
 

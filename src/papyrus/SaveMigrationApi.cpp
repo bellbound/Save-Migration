@@ -51,9 +51,8 @@ bool RestoreNow(RE::StaticFunctionTag*) {
 }
 
 bool ClearRestoreFlag(RE::StaticFunctionTag*) {
-    Core::MigrationState::Get().ClearRestoreDecision();
-    RE::DebugNotification("Save Migration: restore decision cleared. Save and reload to be asked "
-                          "again.");
+    Core::MigrationState::Get().ClearAppliedDecision();
+    RE::DebugNotification("Save Migration: this save can be imported into again.");
     return true;
 }
 
@@ -67,21 +66,7 @@ int32_t PendingCount(RE::StaticFunctionTag*) {
 }
 
 RE::BSFixedString StatusReport(RE::StaticFunctionTag*) {
-    const auto& state = Core::MigrationState::Get();
-    const auto& identity = Core::SaveIdentity::Get();
-
-    const auto text = std::format(
-        "mode={} saveId={} smidFound={} reverted={} newGame={} applied={} declined={} "
-        "askBeforeImport={} pending={} vrLayout={}",
-        Config::MigrationConfig::IsSnapshotMode() ? "SNAPSHOT" : "RESTORE", identity.SaveId(),
-        identity.WasFoundInCoSave(), identity.HasReverted(),
-        state.HasFlag(Core::StateFlag::kSeenNewGame),
-        state.HasFlag(Core::StateFlag::kRestoreApplied),
-        state.HasFlag(Core::StateFlag::kRestoreDeclined),
-        Config::MigrationConfig::AskBeforeImport(),
-        Defer::PendingWorkQueue::Get().Size(),
-        Core::VRLayoutProbe::Get().IsLayoutTrusted() ? "trusted" : "SUSPECT");
-
+    const auto text = StatusText();
     spdlog::info("SaveMigrationApi: {}", text);
     return RE::BSFixedString(text.c_str());
 }
@@ -108,6 +93,21 @@ RE::BSFixedString SnapshotList(RE::StaticFunctionTag*) {
 }
 
 }  // namespace
+
+std::string StatusText() {
+    const auto& state = Core::MigrationState::Get();
+    const auto& identity = Core::SaveIdentity::Get();
+
+    return std::format(
+        "saveId={} smidFound={} reverted={} newGame={} applied={} inProgress={} autoOnSave={} "
+        "pending={} vrLayout={}",
+        identity.SaveId().empty() ? "(none)" : identity.SaveId(), identity.WasFoundInCoSave(),
+        identity.HasReverted(), state.HasFlag(Core::StateFlag::kSeenNewGame),
+        state.HasFlag(Core::StateFlag::kRestoreApplied),
+        state.HasFlag(Core::StateFlag::kRestoreInProgress),
+        Config::MigrationConfig::AutoExportOnSave(), Defer::PendingWorkQueue::Get().Size(),
+        Core::VRLayoutProbe::Get().IsLayoutTrusted() ? "trusted" : "SUSPECT");
+}
 
 bool SaveMigrationApi::Bind(RE::BSScript::IVirtualMachine* vm) {
     if (!vm) {

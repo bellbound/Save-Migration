@@ -36,7 +36,11 @@ void PlayerInventory::Collect(Core::CollectContext& ctx) {
     const auto itemCount = collected.items.size();
     const auto unmigratableCount = collected.unmigratable.size();
     payload["items"] = std::move(collected.items);
-    payload["unmigratable"] = std::move(collected.unmigratable);
+    // Absent rather than empty when there is nothing unmigratable - the applier
+    // looks the key up and tolerates its absence.
+    if (unmigratableCount > 0) {
+        payload["unmigratable"] = std::move(collected.unmigratable);
+    }
 
     ctx.report.Succeeded(Report::PlayerSubject(), "player_inventory", "",
                          std::format("{} entries", itemCount));

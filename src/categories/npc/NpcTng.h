@@ -32,7 +32,9 @@ namespace SaveMigration::Categories {
 class NpcTng final : public Core::IActorCategory {
 public:
     [[nodiscard]] const Core::CategoryDescriptor& Describe() const override;
-    void PrepareCollect(RE::PlayerCharacter* player) override;
+    /// Player only, so the prime roster is unused here.
+    void PrepareCollect(RE::PlayerCharacter* player,
+                        const std::vector<Model::ActorSubject>& roster) override;
     void CollectActor(const Model::ActorSubject& subject, Core::CollectContext& ctx) override;
     void ApplyActor(const Model::ActorSubject& subject, Core::ApplyContext& ctx) override;
     bool ApplyDeferred(const Model::ActorSubject& subject, Core::ApplyContext& ctx) override;

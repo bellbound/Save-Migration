@@ -1,6 +1,5 @@
 #include "core/PromptGate.h"
 
-#include "config/MigrationConfig.h"
 #include "util/GameThread.h"
 #include "util/MessageBoxUtil.h"
 
@@ -89,9 +88,7 @@ void PromptGate::Poll(std::string label, std::function<void()> show, uint32_t at
 
     uint32_t delayMs = kPollIntervalMs;
     if (attempt == 0) {
-        delayMs = initialDelayMs < 0
-                      ? static_cast<uint32_t>(Config::MigrationConfig::PromptDelayMs())
-                      : static_cast<uint32_t>(initialDelayMs);
+        delayMs = initialDelayMs < 0 ? kDefaultDelayMs : static_cast<uint32_t>(initialDelayMs);
     }
     // A detached timer thread, never a sleep on the game thread: the loading
     // screen we are waiting on is pumped *by* the game thread, so sleeping there

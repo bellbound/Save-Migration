@@ -56,6 +56,12 @@ std::vector<PendingItem> PendingWorkQueue::Items() const {
     return m_items;
 }
 
+std::vector<PendingItem> PendingWorkQueue::Items(uint64_t& generationOut) const {
+    std::lock_guard lock(m_mutex);
+    generationOut = m_generation;
+    return m_items;
+}
+
 void PendingWorkQueue::Replace(std::vector<PendingItem> items) {
     std::lock_guard lock(m_mutex);
     m_items = std::move(items);
@@ -65,8 +71,19 @@ void PendingWorkQueue::Replace(std::vector<PendingItem> items) {
 
 void PendingWorkQueue::CommitDrain(
     std::vector<PendingItem> survivors,
-    const std::vector<std::pair<std::string, std::string>>& processed) {
+    const std::vector<std::pair<std::string, std::string>>& processed,
+    uint64_t generationAtStart) {
     std::lock_guard lock(m_mutex);
+
+    if (m_generation == generationAtStart) {
+        // Nothing touched the queue during the pass, so `survivors` is the whole
+        // truth and the reconciliation below has nothing to find. This is the
+        // path taken on essentially every drain.
+        m_items = std::move(survivors);
+        ++m_generation;
+        RebuildWatchSets();
+        return;
+    }
 
     // Anything in the live queue that the drain neither saw nor produced was
     // enqueued by an applier during the pass. Wholesale replacement would throw

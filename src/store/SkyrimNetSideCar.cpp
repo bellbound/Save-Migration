@@ -285,10 +285,14 @@ std::string SkyrimNetSideCar::CurrentSaveId() {
     // a DLL boundary is only safe because both sides are built with the same MSVC
     // toolchain from this workspace; if that ever stops being true, read the id from
     // the database filename instead.
+    //
+    // Only the `Public`-prefixed name is accepted. It is the one SkyrimNet declares
+    // inside its `extern "C"` block and therefore the one whose undecorated name is
+    // a deliberate contract. A bare "GetSaveUniqueID" export has never existed, and
+    // guessing at it would mean calling an unknown symbol through a signature that
+    // returns std::string by value - an sret pointer into a foreign allocator, which
+    // corrupts the heap rather than failing.
     auto fn = reinterpret_cast<GetSaveIdFn>(GetProcAddress(module, "PublicGetSaveUniqueID"));
-    if (!fn) {
-        fn = reinterpret_cast<GetSaveIdFn>(GetProcAddress(module, "GetSaveUniqueID"));
-    }
     if (!fn) {
         spdlog::warn("SkyrimNetSideCar: SkyrimNet.dll exports no save-id accessor");
         return {};

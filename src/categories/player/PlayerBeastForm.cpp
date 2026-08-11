@@ -64,10 +64,10 @@ void PlayerBeastForm::Collect(Core::CollectContext& ctx) {
         const char* raceName = base->race->GetFullName();
         payload["raceName"] = (raceName && *raceName) ? raceName : "";
     }
-    payload["werewolfFeedCount"] = nullptr;
-    payload["werewolfFeedCountNote"] =
-        "No accessor for the werewolf feed count exists in this CommonLib fork, so it is not "
-        "recorded rather than being recorded wrongly.";
+    // No `werewolfFeedCount`. There is no accessor for it in this CommonLib fork,
+    // so it was previously written as an explicit null beside a note explaining
+    // the null - two fields that carried no data and that the importer had
+    // nothing to do with. A field that cannot be read is simply absent.
 
     ctx.report.Succeeded(Report::PlayerSubject(), "beast_points", "",
                          std::format("werewolf {:.0f}, vampire {:.0f} banked point(s)",
@@ -121,9 +121,10 @@ void PlayerBeastForm::Apply(Core::ApplyContext& ctx) {
             recordedRaceName);
     }
 
-    ctx.report.SkippedItem(subject, "werewolf_feed_count", Report::ReasonCode::kPartialByDesign,
-                           "the werewolf feed count was not carried: no accessor for it exists in "
-                           "this CommonLib fork, so it was never recorded.");
+    // Nothing here about the werewolf feed count. It reported a skip on every
+    // single import, whatever the snapshot held and whether or not the character
+    // had ever been a werewolf - a line in every report that told the reader only
+    // that a field this plugin cannot read had not been read.
 }
 
 }  // namespace SaveMigration::Categories

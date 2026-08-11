@@ -117,9 +117,9 @@ RE::BSScript::Internal::VirtualMachine* PapyrusInterface::GetVM() {
     return RE::BSScript::Internal::VirtualMachine::GetSingleton();
 }
 
-bool PapyrusInterface::HasGlobalFunction(const std::string& scriptName,
-                                         const std::string& functionName) {
-    // Dispatching a global function a script does not declare is not a graceful
+bool PapyrusInterface::HasFunction(const std::string& scriptName, const std::string& functionName,
+                                   std::size_t argCount, bool memberFunctions, bool walkParents) {
+    // Dispatching a function a script does not declare is not a graceful
     // "returns false" - it crashed the game from inside the VM (2026-08-07: TNG has
     // no GetActorAddonForm, and the access violation landed in SkyrimVR.exe).
     // Third-party scripts rename and drop functions between versions, so every
@@ -129,7 +129,8 @@ bool PapyrusInterface::HasGlobalFunction(const std::string& scriptName,
         return false;
     }
 
-    const auto key = std::format("{}::{}", scriptName, functionName);
+    const char* kind = memberFunctions ? "member" : "global";
+    const auto key = std::format("{}::{}/{}{}", scriptName, functionName, kind[0], argCount);
     {
         const std::lock_guard lock(m_functionCacheMutex);
         if (const auto it = m_functionCache.find(key); it != m_functionCache.end()) {
@@ -138,28 +139,86 @@ bool PapyrusInterface::HasGlobalFunction(const std::string& scriptName,
     }
 
     bool present = false;
+    bool arityOk = false;
+    bool sawUnlinked = false;
+    std::uint32_t declaredParams = 0;
+
     RE::BSTSmartPointer<RE::BSScript::ObjectTypeInfo> typeInfo;
-    if (vm->GetScriptObjectType(RE::BSFixedString(scriptName.c_str()), typeInfo) && typeInfo) {
-        const auto* iter = typeInfo->GetGlobalFuncIter();
-        const auto count = typeInfo->GetNumGlobalFuncs();
-        for (std::uint32_t i = 0; i < count && !present; ++i) {
-            const auto& func = iter[i].func;
-            // Papyrus identifiers are case-insensitive.
-            if (func && Util::IEquals(func->GetName().c_str(), functionName)) {
+    if (vm->GetScriptObjectType(RE::BSFixedString(scriptName.c_str()), typeInfo)) {
+        for (auto* type = typeInfo.get(); type && !present; type = walkParents ? type->GetParent()
+                                                                               : nullptr) {
+            // `data` is only the table blob the iterators assume once the type is
+            // linked; before that it is an UnlinkedNativeFunction list head, and
+            // every GetXIter() would compute an offset from a linked-list node.
+            // A type that failed to link is exactly what a mod with changed
+            // internals produces, so this is the case being defended against.
+            if (!type->IsLinked()) {
+                sawUnlinked = true;
+                spdlog::warn("PapyrusInterface: script type '{}' is not linked - its function "
+                             "tables cannot be read, so {}::{} is treated as absent",
+                             type->GetName() ? type->GetName() : scriptName.c_str(), scriptName,
+                             functionName);
+                break;
+            }
+
+            const auto count =
+                memberFunctions ? type->GetNumMemberFuncs() : type->GetNumGlobalFuncs();
+            const auto* members = memberFunctions ? type->GetMemberFuncIter() : nullptr;
+            const auto* globals = memberFunctions ? nullptr : type->GetGlobalFuncIter();
+            for (std::uint32_t i = 0; i < count && !present; ++i) {
+                const auto& func = memberFunctions ? members[i].func : globals[i].func;
+                // Papyrus identifiers are case-insensitive.
+                if (!func || !Util::IEquals(func->GetName().c_str(), functionName)) {
+                    continue;
+                }
                 present = true;
+                declaredParams = func->GetParamCount();
+                // Papyrus allows default parameter values, and `IFunction` does not
+                // say which parameters have one - so passing fewer than declared may
+                // be perfectly legal and is only warned about. Passing *more* never
+                // is: the surplus lands past the frame the function was compiled for.
+                arityOk = argCount <= declaredParams;
             }
         }
     }
 
     if (!present) {
-        spdlog::warn("PapyrusInterface: script '{}' declares no global function '{}' - skipping "
+        spdlog::warn("PapyrusInterface: script '{}' declares no {} function '{}' - skipping "
                      "the call rather than dispatching into the VM",
-                     scriptName, functionName);
+                     scriptName, kind, functionName);
+    } else if (!arityOk) {
+        spdlog::warn("PapyrusInterface: {}::{} takes {} parameter(s) but {} were about to be "
+                     "passed - skipping the call. The installed version of this mod does not "
+                     "match the one this build was written against.",
+                     scriptName, functionName, declaredParams, argCount);
+    } else if (argCount < declaredParams) {
+        spdlog::info("PapyrusInterface: {}::{} declares {} parameter(s) and {} are being passed; "
+                     "proceeding on the assumption the rest have defaults.",
+                     scriptName, functionName, declaredParams, argCount);
     }
 
-    const std::lock_guard lock(m_functionCacheMutex);
-    m_functionCache[key] = present;
-    return present;
+    const bool callable = present && arityOk;
+    // "Not linked yet" is a state, not a verdict - linking happens lazily and a
+    // later call may well find the tables readable. Caching that answer would turn
+    // a transient miss into a permanently disabled integration.
+    if (!sawUnlinked) {
+        const std::lock_guard lock(m_functionCacheMutex);
+        m_functionCache[key] = callable;
+    }
+    return callable;
+}
+
+bool PapyrusInterface::HasGlobalFunction(const std::string& scriptName,
+                                         const std::string& functionName, std::size_t argCount) {
+    // A global is declared on exactly one script, so there is no parent to walk.
+    return HasFunction(scriptName, functionName, argCount, false, false);
+}
+
+bool PapyrusInterface::HasMethod(const std::string& scriptName, const std::string& functionName,
+                                 std::size_t argCount) {
+    // Member functions are inherited - `MoveToNearestNavmeshLocation` is called
+    // through "ObjectReference" but a mod script's own method may sit on its base.
+    return HasFunction(scriptName, functionName, argCount, true, true);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -308,7 +367,7 @@ bool PapyrusInterface::CallGlobalFunction(const std::string& scriptName,
         spdlog::error("PapyrusInterface: no VM for {}::{}", scriptName, functionName);
         return false;
     }
-    if (!HasGlobalFunction(scriptName, functionName)) {
+    if (!HasGlobalFunction(scriptName, functionName, args.size())) {
         return false;
     }
     DynamicFunctionArguments funcArgs(this, args);
@@ -327,7 +386,7 @@ bool PapyrusInterface::CallGlobalFunctionInt(const std::string& scriptName,
     if (!vm) {
         return false;
     }
-    if (!HasGlobalFunction(scriptName, functionName)) {
+    if (!HasGlobalFunction(scriptName, functionName, args.size())) {
         return false;
     }
     DynamicFunctionArguments funcArgs(this, args);
@@ -343,7 +402,7 @@ bool PapyrusInterface::CallGlobalFunctionString(const std::string& scriptName,
     if (!vm) {
         return false;
     }
-    if (!HasGlobalFunction(scriptName, functionName)) {
+    if (!HasGlobalFunction(scriptName, functionName, args.size())) {
         return false;
     }
     DynamicFunctionArguments funcArgs(this, args);
@@ -365,7 +424,7 @@ bool PapyrusInterface::CallGlobalFunctionBool(const std::string& scriptName,
     if (!vm) {
         return false;
     }
-    if (!HasGlobalFunction(scriptName, functionName)) {
+    if (!HasGlobalFunction(scriptName, functionName, args.size())) {
         return false;
     }
     DynamicFunctionArguments funcArgs(this, args);
@@ -381,7 +440,7 @@ bool PapyrusInterface::CallGlobalFunctionForm(const std::string& scriptName,
     if (!vm) {
         return false;
     }
-    if (!HasGlobalFunction(scriptName, functionName)) {
+    if (!HasGlobalFunction(scriptName, functionName, args.size())) {
         return false;
     }
     DynamicFunctionArguments funcArgs(this, args);
@@ -397,7 +456,7 @@ bool PapyrusInterface::CallGlobalFunctionStringArray(const std::string& scriptNa
     if (!vm) {
         return false;
     }
-    if (!HasGlobalFunction(scriptName, functionName)) {
+    if (!HasGlobalFunction(scriptName, functionName, args.size())) {
         return false;
     }
     DynamicFunctionArguments funcArgs(this, args);
@@ -438,6 +497,9 @@ bool PapyrusInterface::ResolveHandle(RE::TESForm* form, const std::string& scrip
 bool PapyrusInterface::CallMethod(RE::TESForm* target, const std::string& scriptName,
                                  const std::string& functionName,
                                  const std::vector<PapyrusValue>& args) {
+    if (!HasMethod(scriptName, functionName, args.size())) {
+        return false;
+    }
     RE::BSScript::Internal::VirtualMachine* vm = nullptr;
     RE::VMHandle handle{};
     if (!ResolveHandle(target, scriptName, vm, handle)) {
@@ -455,6 +517,9 @@ bool PapyrusInterface::CallMethod(RE::TESForm* target, const std::string& script
 bool PapyrusInterface::CallMethodInt(RE::TESForm* target, const std::string& scriptName,
                                     const std::string& functionName,
                                     const std::vector<PapyrusValue>& args, IntCallback callback) {
+    if (!HasMethod(scriptName, functionName, args.size())) {
+        return false;
+    }
     RE::BSScript::Internal::VirtualMachine* vm = nullptr;
     RE::VMHandle handle{};
     if (!ResolveHandle(target, scriptName, vm, handle)) {
@@ -468,6 +533,9 @@ bool PapyrusInterface::CallMethodInt(RE::TESForm* target, const std::string& scr
 bool PapyrusInterface::CallMethodBool(RE::TESForm* target, const std::string& scriptName,
                                      const std::string& functionName,
                                      const std::vector<PapyrusValue>& args, BoolCallback callback) {
+    if (!HasMethod(scriptName, functionName, args.size())) {
+        return false;
+    }
     RE::BSScript::Internal::VirtualMachine* vm = nullptr;
     RE::VMHandle handle{};
     if (!ResolveHandle(target, scriptName, vm, handle)) {
@@ -481,6 +549,9 @@ bool PapyrusInterface::CallMethodBool(RE::TESForm* target, const std::string& sc
 bool PapyrusInterface::CallAliasMethod(RE::BGSBaseAlias* alias, const std::string& scriptName,
                                       const std::string& functionName,
                                       const std::vector<PapyrusValue>& args) {
+    if (!HasMethod(scriptName, functionName, args.size())) {
+        return false;
+    }
     auto* vm = GetVM();
     if (!vm || !alias) {
         return false;

@@ -53,8 +53,7 @@ void VrEditorFilesCategory::Collect(Core::CollectContext& ctx) {
     // `_SWAP.ini` files means listing the `Data` root, which under MO2's virtual
     // file system is a merge across the whole load order. The harvest is one
     // game-thread task measured in tens of milliseconds and must not wear that.
-    const auto snapshotDir =
-        Store::SnapshotPaths::SnapshotDir(ctx.doc.saveId, ctx.doc.characterName);
+    const auto snapshotDir = ctx.doc.snapshotDir;
 
     Core::Worker::Get().Post("vreditor-files-snapshot", [snapshotDir]() {
         const auto result = Store::VrEditorFiles::TakeSnapshot(snapshotDir);
@@ -83,7 +82,6 @@ void VrEditorFilesCategory::Collect(Core::CollectContext& ctx) {
             {"files", std::move(files)},
             {"totalBytes", result.totalBytes},
             {"swapFileCount", swapFiles},
-            {"note", std::string(kScopeNote)},
         };
         Util::WriteFileAtomic(Store::SnapshotPaths::VrEditorDir(snapshotDir) / "index.json",
                               Util::SafeDump(index, 2));
@@ -92,9 +90,11 @@ void VrEditorFilesCategory::Collect(Core::CollectContext& ctx) {
     // The payload is a marker. It cannot hold the file list - that is only known
     // once the worker has run - and the import does not need it: the restore
     // walks the snapshot's own copies.
+    // `copyQueued` and nothing else: `kScopeNote` went into the payload *and* the
+    // index *and* the report, three copies of one constant sentence per export.
+    // The report is where a human reads it.
     auto& payload = ctx.Payload(kId, Describe().schemaVersion);
     payload["copyQueued"] = true;
-    payload["note"] = std::string(kScopeNote);
 
     ctx.report.Succeeded(subject, "vreditor_files", "", "queued for copy");
     ctx.report.Info(std::string(kScopeNote));
@@ -113,8 +113,7 @@ void VrEditorFilesCategory::Apply(Core::ApplyContext& ctx) {
         return;
     }
 
-    const auto snapshotDir =
-        Store::SnapshotPaths::SnapshotDir(ctx.doc.saveId, ctx.doc.characterName);
+    const auto snapshotDir = ctx.doc.snapshotDir;
     const bool includeConfig = Config::MigrationConfig::RestoreVrEditorConfig();
 
     // Worker again, for the same reason. `Restore` reports its own outcome to the

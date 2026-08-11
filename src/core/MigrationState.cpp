@@ -41,11 +41,9 @@ bool MigrationState::Load(SKSE::SerializationInterface* intfc, uint32_t, uint32_
     m_restoredFrom = std::move(restoredFrom);
     m_restoredAtGameTime = gameTime;
 
-    spdlog::info(
-        "MigrationState: flags=0x{:X} (newGame={}, applied={}, declined={}, inProgress={}), from='{}'",
-        m_flags, HasFlag(StateFlag::kSeenNewGame), HasFlag(StateFlag::kRestoreApplied),
-        HasFlag(StateFlag::kRestoreDeclined), HasFlag(StateFlag::kRestoreInProgress),
-        m_restoredFrom);
+    spdlog::info("MigrationState: flags=0x{:X} (newGame={}, applied={}, inProgress={}), from='{}'",
+                 m_flags, HasFlag(StateFlag::kSeenNewGame), HasFlag(StateFlag::kRestoreApplied),
+                 HasFlag(StateFlag::kRestoreInProgress), m_restoredFrom);
     return true;
 }
 
@@ -78,11 +76,15 @@ void MigrationState::MarkRestored(std::string snapshotId, float gameTimeDays) {
                  gameTimeDays);
 }
 
-void MigrationState::ClearRestoreDecision() {
+void MigrationState::ClearAppliedDecision() {
     ClearFlag(StateFlag::kRestoreApplied);
-    ClearFlag(StateFlag::kRestoreDeclined);
+    // Cleared together, because a run abandoned part-way is exactly the case
+    // this exists for and it leaves the in-progress flag set - which
+    // `SnapshotOrchestrator::ShouldTake` then reads as a half-restored world and
+    // refuses to export from for the rest of the save line.
     ClearFlag(StateFlag::kRestoreInProgress);
-    spdlog::warn("MigrationState: restore decision cleared by debug request");
+    spdlog::warn("MigrationState: applied flag cleared on request; this save line can be imported "
+                 "into again");
 }
 
 }  // namespace SaveMigration::Core

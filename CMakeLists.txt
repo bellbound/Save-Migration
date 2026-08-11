@@ -37,6 +37,10 @@ target_compile_definitions(
     PRIVATE
         WIN32_LEAN_AND_MEAN
         NOMINMAX
+        # Stamped into every snapshot manifest. The field existed and was always
+        # written empty, which made it impossible to tell which build wrote a
+        # snapshot - exactly the question you have when an old one will not import.
+        SAVEMIGRATION_VERSION="${PROJECT_VERSION}"
 )
 
 target_include_directories(

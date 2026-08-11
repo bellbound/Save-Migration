@@ -54,8 +54,7 @@ void SkyrimNetSideCarCategory::Collect(Core::CollectContext& ctx) {
     auto& payload = ctx.Payload(kId, Describe().schemaVersion);
     payload["oldSaveId"] = oldSaveId;
 
-    const auto snapshotDir =
-        Store::SnapshotPaths::SnapshotDir(ctx.doc.saveId, ctx.doc.characterName);
+    const auto snapshotDir = ctx.doc.snapshotDir;
     const auto maxBytes =
         static_cast<uint64_t>(Config::MigrationConfig::MaxSideCarMb()) * 1024ull * 1024ull;
 
@@ -76,10 +75,10 @@ void SkyrimNetSideCarCategory::Collect(Core::CollectContext& ctx) {
             {"promptBytes", result.promptBytes},
             {"embeddingsDropped", result.embeddingsDropped},
             {"talkedToCount", result.talkedToRefKeys.size()},
-            {"note",
-             "UUIDs are deliberately not rewritten: Entity::CalculateUUID normalises the FormID "
-             "before hashing, so every *_uuid column is already load-order independent. Only "
-             "uuid_mappings.form_id needs repair."},
+            // No `note`. It was a constant sentence about why UUID columns are
+            // left alone - true, and a fact about this code rather than about the
+            // database being copied. It lives in `SkyrimNetSideCar` where the
+            // decision is made.
         };
         Util::WriteFileAtomic(Store::SnapshotPaths::SkyrimNetDir(snapshotDir) / "sidecar.json",
                               Util::SafeDump(sidecar, 2));
@@ -123,7 +122,7 @@ void SkyrimNetSideCarCategory::Apply(Core::ApplyContext& ctx) {
         return;
     }
 
-    const auto snapshotDir = Store::SnapshotPaths::SnapshotDir(ctx.doc.saveId, ctx.doc.characterName);
+    const auto snapshotDir = ctx.doc.snapshotDir;
     const auto snapshotOrder = Store::LoadOrderFingerprint::FromJson(ctx.doc.loadOrder);
 
     Store::SkyrimNetSideCar::ImportOptions options;
