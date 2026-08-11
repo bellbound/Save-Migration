@@ -45,7 +45,7 @@ it inside the game folder instead.
 
 ### Player
 
-| | |
+| What | Notes |
 |---|---|
 | Player name | Off by default, experimental — see below |
 | Skills and skill XP | Including partial progress toward the next point |
@@ -63,7 +63,7 @@ it inside the game folder instead.
 
 ### Followers and NPCs
 
-| | |
+| What | Notes |
 |---|---|
 | NPC roster | Who mattered, and the identity the rest of the run resolves against |
 | NPC factions and wait state | Follower factions, waiting, and where |
@@ -84,7 +84,7 @@ it inside the game folder instead.
 
 ### World
 
-| | |
+| What | Notes |
 |---|---|
 | Cleared locations | Which dungeons read as cleared |
 | Stored containers | **Off by default in both directions.** Around 2 MB even from a fresh save, and importing it resets many containers to how they were in the other save — including ones you never touched |
@@ -95,7 +95,7 @@ Whole mods' files, rather than save state. **Export is on by default, import is 
 are files, and writing them is a bigger decision than writing a number into a save. On import
 each is offered only if the snapshot actually contains it, and the menu names what it holds.
 
-| | |
+| What | Notes |
 |---|---|
 | RaceMenu presets (all) | Every preset the install can see, packs included |
 | BodySlide presets (all) | Slider presets; slider *groups* deliberately left behind |
