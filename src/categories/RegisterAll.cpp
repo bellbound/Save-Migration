@@ -9,7 +9,6 @@
 #include "categories/player/PlayerInventory.h"
 #include "categories/player/PlayerLocation.h"
 #include "categories/player/PlayerMapMarkers.h"
-#include "categories/player/PlayerPerks.h"
 #include "categories/player/PlayerSkills.h"
 #include "categories/player/PlayerSpellsShouts.h"
 #include "categories/npc/FollowerRegroup.h"
@@ -69,14 +68,19 @@ void RegisterAllCategories() {
     registry.AddGlobal(std::make_unique<PlayerSkills>());
 
     // ── Phase kProgression ────────────────────────────────────────────────
-    // Level and perk points, then perks (chain-ordered), then beast perks.
+    // Level and perk points, then beast points.
+    //
+    // There is no perk category. Perks are not migrated: which ones a character
+    // could have bought is a fact about the exporting load order's perk trees,
+    // and the importing one is usually a different overhaul entirely. `PlayerLevel`
+    // grants one perk point per level instead, so the build gets re-bought from
+    // the trees this install actually has.
     registry.AddGlobal(std::make_unique<PlayerLevel>());
-    registry.AddGlobal(std::make_unique<PlayerPerks>());
     registry.AddGlobal(std::make_unique<PlayerBeastForm>());
 
     // ── Phase kAbilities ──────────────────────────────────────────────────
-    // Some abilities are perk-conditioned, so they follow perks; and equipment
-    // cannot equip a spell the player does not yet know, so they precede it.
+    // Equipment cannot equip a spell the player does not yet know, so spells
+    // precede it.
     registry.AddGlobal(std::make_unique<PlayerSpellsShouts>());
 
     // ── Phase kEconomy ────────────────────────────────────────────────────
@@ -112,8 +116,8 @@ void RegisterAllCategories() {
     registry.AddActor(std::make_unique<NpcTng>());
 
     // ── Phase kInventory ──────────────────────────────────────────────────
-    // Perks and skills affect value, armour rating and temper, all of which are
-    // computed as the item enters the container.
+    // Skills affect value, armour rating and temper, all of which are computed
+    // as the item enters the container.
     registry.AddGlobal(std::make_unique<PlayerInventory>());
 
     // ── Phase kEquipment ──────────────────────────────────────────────────
@@ -129,21 +133,16 @@ void RegisterAllCategories() {
     registry.AddGlobal(std::make_unique<ClearedLocations>());
     registry.AddGlobal(std::make_unique<StoredContainers>());
 
-    // ── Phase kTeleport ───────────────────────────────────────────────────
-    // Equip while stationary in the start cell; a mid-teleport equip desyncs the
-    // biped. Followers move only *after* this, which is the whole ordering point
-    // of the phase after it.
-    registry.AddGlobal(std::make_unique<PlayerLocation>());
-
     // ── Phase kFollowers ──────────────────────────────────────────────────
-    // Intra-phase order is this registration order, and it matters:
+    // Everything about the followers *except* where they are standing, so all of
+    // it lands while the party is still together in the start cell. Intra-phase
+    // order is this registration order, and it matters:
     //
     //   factions/wait -> relationship  : both must precede any re-recruit, since
     //                                    SetFollower overwrites the rank to >= 3.
     //   inventory                      : eager, needs no 3D.
     //   equipment                      : deferred, needs 3D - queued here.
     //   life state                     : after inventory, so a corpse is lootable.
-    //   regroup                        : after the player has already teleported.
     //   attribute re-assert            : last, after worn enchantments have written
     //                                    the temporary modifier channel.
     registry.AddActor(std::make_unique<NpcWaitState>());
@@ -151,13 +150,28 @@ void RegisterAllCategories() {
     registry.AddActor(std::make_unique<NpcInventory>());
     registry.AddActor(std::make_unique<NpcEquipment>());
     registry.AddActor(std::make_unique<NpcLifeState>());
-    registry.AddActor(std::make_unique<FollowerRegroup>());
     registry.AddGlobal(std::make_unique<PlayerAttributesReassert>());
 
     // ── Phase kIntegrations (90): behaviour changes, after everything else ──
     // Registering an AI package can walk the actor out of the loaded set, which
-    // would abort anything still queued behind it - so this is last.
+    // would abort anything still queued behind it - so this is the last phase
+    // that writes state.
     registry.AddActor(std::make_unique<NpcSkyrimNetAccompany>());
+
+    // ── Phase kTeleport (92) ──────────────────────────────────────────────
+    // The move is now the last thing done to the world, not something done
+    // halfway through. Every write above happens with the player stationary in an
+    // already-attached cell - equipping mid-teleport desyncs the biped, and an
+    // integration asked to re-place a marker or register a package while a cell
+    // transition is in flight is asked at the worst possible moment.
+    registry.AddGlobal(std::make_unique<PlayerLocation>());
+
+    // ── Phase kRegroup (94) ───────────────────────────────────────────────
+    // Followers move only after the player has, and the phase boundary is what
+    // gives that transition a frame - and a settle - to land first. Moving into a
+    // cell the player is still arriving in is what produced "moved to the
+    // player's cell but ended up in X" in the report.
+    registry.AddActor(std::make_unique<FollowerRegroup>());
 
     // ── Phase kSideCar: the clock, dead last ──────────────────────────────
     // A GameDaysPassed jump detonates every armed timer in the load order, so

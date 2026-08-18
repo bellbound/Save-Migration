@@ -5,6 +5,7 @@
 #include "core/VRLayoutProbe.h"
 #include "model/WellKnownForms.h"
 #include "store/LoadOrderFingerprint.h"
+#include "util/StringUtil.h"
 
 namespace SaveMigration::Categories {
 
@@ -99,13 +100,17 @@ void LoadOrderCategory::Apply(Core::ApplyContext& ctx) {
                          std::format("snapshot had {} plugins, {} missing here, {} new", pluginCount,
                                      ctx.missingPlugins.size(), 0));
 
-    // One aggregate line per missing plugin rather than one per lost item. The
-    // per-item detail is still in each category's own failures.
-    for (const auto& plugin : ctx.missingPlugins) {
-        ctx.report.Warn(Report::ReasonCode::kSourcePluginMissing,
-                        std::format("'{}' is in the snapshot but not in this load order. Every key "
-                                    "from it was pre-failed without a lookup being attempted.",
-                                    plugin));
+    // One line for the whole set, not one per plugin. This used to print a warning
+    // for every absent plugin - 820 of them on a modlist that has moved on - and a
+    // missing plugin is a fact about the *load order*, which the LOAD ORDER section
+    // above already lists in full. The per-item detail stays in each category's own
+    // failures, where it is attached to something the player recognises.
+    if (!ctx.missingPlugins.empty()) {
+        ctx.report.Warn(
+            Report::ReasonCode::kSourcePluginMissing,
+            std::format("{} plugin(s) in the snapshot are not in this load order, so every key from "
+                        "them was pre-failed without a lookup being attempted: {}",
+                        ctx.missingPlugins.size(), Util::JoinCapped(ctx.missingPlugins, 8)));
     }
 }
 

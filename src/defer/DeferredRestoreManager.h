@@ -36,6 +36,40 @@ public:
     /// Debug native support.
     void ForceDrain();
 
+    struct DrainOutcome {
+        /// Items retired by this pass - applied, or given up on for a stated
+        /// reason. Either way they are off the queue.
+        uint32_t retired = 0;
+        /// Items that touched the world, which is what the per-frame budget counts.
+        uint32_t worked = 0;
+        /// Queue size after the pass.
+        size_t remaining = 0;
+        /// The pass stopped on `kMaxAppliesPerDrain` with items still untried.
+        bool budgetHit = false;
+    };
+
+    /// Drain synchronously, on the calling (game) thread, into a caller's sink.
+    ///
+    /// This is what lets the import's settle pass drain the queue *and put the
+    /// results in the import report*. The ordinary event-driven drain writes into
+    /// its own supplement sink, which becomes a separate file the player has to go
+    /// and find - correct for work that lands an hour later, wrong for work that
+    /// lands four hundred milliseconds after the regroup.
+    ///
+    /// `releaseImmediate` lets `Trigger::kImmediate` items through. The settle pass
+    /// holds it back until the 3D-gated work has stopped landing, because those
+    /// items exist to be ordered *after* it.
+    DrainOutcome DrainNow(Report::ReportSink& sink, bool releaseImmediate);
+
+    /// Emit one `Deferred` line per surviving item, and return how many.
+    ///
+    /// Categories deliberately do **not** report their own deferral at enqueue
+    /// time: the settle pass usually empties the queue before the run ends, so a
+    /// line written at enqueue would claim the work is waiting before anyone knows
+    /// whether it is - and `ReportSink::ClaimBucket` allows one bucket per item id
+    /// for the whole run, so that first claim could never be corrected.
+    uint32_t ReportRemaining(Report::ReportSink& sink);
+
 private:
     DeferredRestoreManager() = default;
 
@@ -55,6 +89,10 @@ private:
         /// counting it would retire the whole queue after `maxAttempts` loads
         /// without a single subject ever having been seen.
         bool countsAsAttempt = true;
+        /// Let `Trigger::kImmediate` items through. Those have no world
+        /// precondition, so the only question about them is *when* - and the answer
+        /// is "the settle pass, or a game load", never an object-load event.
+        bool releaseImmediate = false;
     };
 
     /// Called by the sinks. Coalesces into one game-thread task per frame.
@@ -64,11 +102,17 @@ private:
     void ScheduleDrain();
     void Drain();
 
+    /// The one drain implementation. `isSupplement` is what decides whether an
+    /// emptied queue writes the supplement report - a settle-pass drain must not,
+    /// because its lines are already in the import report.
+    DrainOutcome DrainPass(const std::vector<ReadySignal>& ready, Report::ReportSink& sink,
+                           bool isSupplement);
+
     /// Apply one item. Returns true to retire it. `didWork` is set when the item
     /// got past its readiness gate and actually touched the world, which is what
     /// the per-frame budget is counted in.
     bool ApplyItem(PendingItem& item, Report::ReportSink& sink, bool countsAsAttempt,
-                   bool& didWork);
+                   bool releaseImmediate, bool& didWork);
 
     /// Write the deferred supplement report once the queue empties.
     void WriteSupplement();

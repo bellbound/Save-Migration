@@ -13,10 +13,3 @@ inline void SetupLog() {
     spdlog::set_level(spdlog::level::trace);
     spdlog::flush_on(spdlog::level::trace);
 }
-
-/// Directory the plugin log lives in — reports are written next to it.
-/// Usually <Documents>\My Games\Skyrim VR\SKSE.
-inline std::filesystem::path LogDirectory() {
-    auto logsFolder = SKSE::log::log_directory();
-    return logsFolder ? *logsFolder : std::filesystem::path{};
-}

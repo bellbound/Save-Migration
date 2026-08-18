@@ -70,8 +70,9 @@ public:
 
     /// A soft ceiling, not a gate. The menu warns and asks for a confirmation
     /// above it; nothing refuses the import. Importing onto a developed
-    /// character overwrites skills, perks and inventory wholesale, which is a
-    /// thing to be sure about rather than a thing to be prevented from doing.
+    /// character overwrites skills, level and inventory wholesale — and resets
+    /// perk points to the incoming level — which is a thing to be sure about
+    /// rather than a thing to be prevented from doing.
     static int MaxLevelForRestore();
     /// Read every restored value back after the run and report anything that did
     /// not stick. Costs one extra pass over the player categories.
@@ -99,10 +100,13 @@ public:
     /// Restoring Lover rank outside the marriage quest desyncs spouse dialogue,
     /// so ranks are capped at Ally unless this is set.
     static bool AllowLoverRank();
-    /// Perks granted by quests (`!PerkData::playable`) are recorded but not
-    /// re-granted by default — regranting them can satisfy quest conditions
-    /// that were never met.
-    static bool RestoreQuestPerks();
+    /// Give back Beast Form and the werewolf blood to a character who had them.
+    /// On by default: it is two spells and it works.
+    static bool RestoreLycanthropy();
+    /// Give back the Vampire Lord form. Off by default and experimental - the
+    /// disease it rides on normally takes three in-game days to turn, which an
+    /// import cannot wait out.
+    static bool RestoreVampireLord();
     /// Apply the snapshot's `VREditor_config.ini` too. Off by default: it holds
     /// grid size and control preferences, which belong to the machine rather
     /// than to the playthrough being carried across.
@@ -113,6 +117,44 @@ public:
     // ── [Perf] ────────────────────────────────────────────────────────────
     static int ItemsPerFrame();
     static int DeferMaxAttempts();
+
+    /// How long the import pauses after a phase that dispatched at least one
+    /// Papyrus call, in milliseconds.
+    ///
+    /// Every call this plugin makes into another mod is asynchronous — the VM
+    /// takes the call and answers on its own thread, some of it several script
+    /// frames later — so a phase returning means its calls were *accepted*, never
+    /// that they ran. Running the next phase in the next engine frame therefore
+    /// wrote on top of work that had not happened yet.
+    ///
+    /// Only phases that actually reached the VM wait: the count is measured, via
+    /// `PapyrusInterface::DispatchCount`, not declared per category. A phase that
+    /// only wrote engine state has nothing in flight and moves on immediately,
+    /// which is why an import on a modlist without these integrations is not
+    /// slowed down at all.
+    static int VmSettlePerPhaseMs();
+    /// Ceiling on the *sum* of those pauses across one import, in milliseconds.
+    ///
+    /// The per-phase figure alone does not bound the total, because how many
+    /// phases reach the VM depends on which mods are installed. This is what keeps
+    /// an import to roughly ten seconds on a full modlist instead of scaling with
+    /// the integration count.
+    static int ImportSettleBudgetMs();
+
+    /// How many rounds the import's settle pass gives the deferred queue before
+    /// giving up on it and leaving the rest to the per-NPC event path.
+    ///
+    /// The pass exists because the apply order guarantees the followers are
+    /// *unloaded* when their gear is queued: `npc.equipment` runs at phase 80 and
+    /// the regroup only teleports them to the player at phase 94. Their 3D attaches
+    /// a frame or two after that move, so one look is not enough and an unbounded
+    /// wait is not acceptable. 0 disables the pass entirely, which restores the
+    /// behaviour where every follower's gear waited for the player to walk back to
+    /// them.
+    static int DeferSettleRounds();
+    /// The pause between those rounds, in milliseconds. A round costs one queue
+    /// walk, so this is almost all of the pass's wall-clock cost.
+    static int DeferSettleRoundMs();
 
     // ── [Debug] ───────────────────────────────────────────────────────────
     /// Log every intended Fertility Mode write without performing it.
@@ -188,13 +230,18 @@ constexpr std::string_view kRestoreName = "Restore:bRestoreName";
 constexpr std::string_view kGameTimeMode = "Restore:iGameTimeMode";
 constexpr std::string_view kKillToMatch = "Restore:bKillToMatch";
 constexpr std::string_view kAllowLoverRank = "Restore:bAllowLoverRank";
-constexpr std::string_view kRestoreQuestPerks = "Restore:bRestoreQuestPerks";
+constexpr std::string_view kRestoreLycanthropy = "Restore:bRestoreLycanthropy";
+constexpr std::string_view kRestoreVampireLord = "Restore:bRestoreVampireLord";
 constexpr std::string_view kRestoreVrEditorConfig = "Restore:bRestoreVrEditorConfig";
 constexpr std::string_view kDisabledCategories = "Restore:sDisabledCategories";
 constexpr std::string_view kPluginAliases = "Restore:sPluginAliases";
 
 constexpr std::string_view kItemsPerFrame = "Perf:iItemsPerFrame";
 constexpr std::string_view kDeferMaxAttempts = "Perf:iDeferMaxAttempts";
+constexpr std::string_view kVmSettlePerPhaseMs = "Perf:iVmSettlePerPhaseMs";
+constexpr std::string_view kImportSettleBudgetMs = "Perf:iImportSettleBudgetMs";
+constexpr std::string_view kDeferSettleRounds = "Perf:iDeferSettleRounds";
+constexpr std::string_view kDeferSettleRoundMs = "Perf:iDeferSettleRoundMs";
 
 constexpr std::string_view kFertilityDryRun = "Debug:bFertilityDryRun";
 constexpr std::string_view kVerifySkillMirror = "Debug:bVerifySkillMirror";

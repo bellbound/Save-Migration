@@ -22,8 +22,8 @@ namespace SaveMigration::Core {
 /// exists for a stated reason - see the apply-order notes on each category.
 enum class Phase : int {
     kFingerprint = 0,   // load order + schema gate; everything is gated on it
-    kIdentity = 10,     // name, level, skills, perks
-    kProgression = 20,  // XP, legendary levels, perk points
+    kIdentity = 10,     // name, skills
+    kProgression = 20,  // level, XP, legendary levels, perk points
     kAbilities = 30,    // spells, shouts, standing stone
     kEconomy = 40,      // H/M/S offsets, dragon souls, gold
 
@@ -50,11 +50,37 @@ enum class Phase : int {
     kInventory = 50,    // items must exist before they can be worn
     kEquipment = 55,
     kWorldState = 60,   // map markers, cleared locations
-    kTeleport = 70,     // player moves only after the map is coherent
-    kFollowers = 80,    // and followers move only after the player has
+    /// Followers' own state - factions, wait flags, relationship, gear, life
+    /// state. Deliberately *not* where they are standing: nothing here moves an
+    /// actor, so all of it can be written while the party is still in the cell
+    /// the new game started in.
+    kFollowers = 80,
     /// Phase-2 work that changes AI behaviour, so it runs after everything that
     /// needs the actor to stay put.
     kIntegrations = 90,
+
+    // ── Moving people, dead last ──────────────────────────────────────────
+    /// The player teleport, after every category that writes anything.
+    ///
+    /// It used to sit at 70, between the world state and the followers, which
+    /// put nine phases' worth of writes *after* a cell transition the engine was
+    /// still finishing. Everything those phases touch - equipping an actor,
+    /// registering a package, asking another mod to re-place a marker - is
+    /// cheaper and more likely to stick while the party is standing still in an
+    /// already-loaded cell. So the move is now the last thing the run does to the
+    /// world, and the only work after it is the moves that depend on it.
+    kTeleport = 92,
+    /// Followers follow. Separated from `kFollowers` so the phase boundary is the
+    /// thing that guarantees the player's transition has been given a frame - and
+    /// a settle - to land before anyone is moved into the cell they landed in.
+    kRegroup = 94,
+    /// Not a category phase - no category registers here, and `PhasesInOrder()`
+    /// therefore never yields it. It is the number the orchestrator's settle pass
+    /// stamps on its own report row, so the row sorts where the work happened:
+    /// after the regroup, because that is what makes the followers reachable, and
+    /// before the side-car.
+    kSettle = 96,
+
     kSideCar = 100,      // database work and the clock, last
 };
 

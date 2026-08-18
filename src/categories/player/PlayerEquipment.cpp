@@ -55,8 +55,22 @@ void PlayerEquipment::Apply(Core::ApplyContext& ctx) {
     }
 
     const auto result = EquipmentCommon::Apply(ctx.player, *worn, subject, ctx);
-    ctx.report.Info(std::format("{} equipped, {} left in inventory after a failed equip",
-                                result.equipped, result.failed));
+
+    // The player is always loaded, so `unconfirmed` here is not "come back later" -
+    // there is no later, this is the only pass. It means the engine took the equip
+    // and the worn flag did not appear, which is worth naming rather than folding
+    // into the success count the way this line used to.
+    ctx.report.Info(std::format("{} equipped and confirmed worn, {} already worn, {} left in "
+                                "inventory after a failed equip",
+                                result.verified, result.alreadyWorn, result.failed));
+    for (const auto& key : result.unconfirmedKeys) {
+        // The same item id `EquipmentCommon` would have used, so the report shows
+        // one row per recorded item however it turned out.
+        ctx.report.Failed(subject, std::format("{}/equip/{}", subject.formKey, key),
+                          Report::ReasonCode::kValidationMismatch,
+                          "the engine accepted the equip but the item did not read back as worn",
+                          key);
+    }
 }
 
 }  // namespace SaveMigration::Categories

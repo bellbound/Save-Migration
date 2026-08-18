@@ -7,9 +7,9 @@ namespace SaveMigration::Categories {
 
 /// The player's inventory.
 ///
-/// Applied after perks and skills, because armour rating, weapon damage and value
-/// are all computed when an item enters the inventory - so adding gear before the
-/// perks that modify it produces the wrong numbers until something recalculates.
+/// Applied after skills, because armour rating, weapon damage and value are all
+/// computed when an item enters the inventory - so adding gear before the skills
+/// that modify it produces the wrong numbers until something recalculates.
 ///
 /// Chunked at `iItemsPerFrame`: a nine-hundred-item hoarder inventory added in one
 /// frame is a visible hitch in VR.

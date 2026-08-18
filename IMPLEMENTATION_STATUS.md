@@ -27,7 +27,7 @@ which is authoritative over the vendored copy in `skse/SkyrimNet/external/`.
 |---|---|---|
 | 1 | `GetInfoRuntimeData()` resolves to VR offset **0** (unsupported); skills must come from `GetVRInfoRuntimeData()` at `0xFE0`. Wrapped once. | `core/VRLayoutProbe.h` → `PlayerSkillsOf()` / `PlayerSkillDataOf()` |
 | 2 | `ResolveToRuntimeFormID` branched on `TESFile::IsLight()`, which is wrong on VR (no ESL space). All resolution now goes through `TESDataHandler::LookupForm`. | `model/FormKeyUtil.cpp`, `model/FormRef.h` |
-| 3 | `addedPerks` / `perks` / `standingStonePerks` are annotated as *guesses* in the header. Never read. Perks come from `GetFormArray<BGSPerk>()` × `HasPerk`. | `categories/player/PlayerPerks.cpp` |
+| 3 | `addedPerks` / `perks` / `standingStonePerks` are annotated as *guesses* in the header. Never read — and now never needed: perks are not migrated at all. | `categories/player/PlayerAttributes.cpp` → `PlayerLevel::Apply` |
 | 4 | `MoveTo_Impl` is private; re-declared against `Offset::TESObjectREFR::MoveTo` (`RELOCATION_ID(56227, 56626)`), the same address CommonLib's own public `SetPosition()` calls. | `util/MoveRefTo.h` |
 
 `ProbeVRLayout()` runs at `kDataLoaded`, sanity-checks the one field the header marks
@@ -177,12 +177,61 @@ notification and no box.
 One `DebugNotification` at most every `iProgressNotifyIntervalSec` (default 5,
 floored at 2 — the widget's own fade time, below which messages overwrite each
 other). Under 64 characters, because that is where `DebugNotification` truncates.
-The apply pass reports `importing N%` by phase; the validation pass reports
-`checking N%`.
+The apply pass reports `importing N%` by phase; the settle pass reports
+`settling 100%`; the validation pass reports `checking N%`.
 
 The three notifications `Finish` used to fire in one frame — reload required,
 deferred count, and now the outcome — are one message box instead. Three
 notifications in a frame means the player sees the last one and nothing else.
+
+### The settle pass — deferred work, inside the run (added 2026-08-12)
+
+Three separate faults, all of them making the import look worse than it was:
+
+1. **The apply order guarantees the followers are unloaded when their gear is
+   queued.** `npc.equipment` runs at phase 80 (`kFollowers`); the regroup only
+   teleports them to the player at phase 94. So the cohort the player cares about
+   *always* took the deferred path — the one branch designed for NPCs on the other
+   side of the map.
+2. **Nothing in the run ever looked again.** The queue drained incidentally, off
+   `TESObjectLoadedEvent`, once the moved actors' 3D attached. Correct, but
+   unmeasured and unowned: its results went to the *supplement* report, a separate
+   file, describing work that finished two seconds into the import.
+3. **`Finish` counted the queue before any of that.** The player was told N items
+   were outstanding for work that completed a moment later, and
+   `ClassifyImport` was handed the same inflated figure.
+
+`RestoreOrchestrator::SettleStep` now sits between the last phase and validation —
+before validation on purpose, since a validator reading back a value the settle is
+about to write would report a mismatch that is not real. It calls
+`DeferredRestoreManager::DrainNow`, which is the ordinary drain pointed at a
+**caller-supplied sink**, so the results land in the import report instead of the
+supplement. Rounds are spaced by `iDeferSettleRoundMs` (400) up to
+`iDeferSettleRounds` (6), and it stops on an empty queue or on **two** consecutive
+rounds that shrink it by nothing. Two, not one: the first round arriving before the
+first follower is equippable is the *expected* case, because the regroup moves one
+per frame and 3D attaches asynchronously after that. A drain that stopped on
+`kMaxAppliesPerDrain` is not a stall — untried is not unreachable.
+
+`Trigger::kImmediate` came out of the same look. `npc.fertility`'s queued item is
+an `AddToFaction` plus a `GetFactionRank` read-back, neither of which needs 3D; it
+was on the queue purely to be ordered *after* the equipment churn, because an
+outfit apply with `unequipOthers` strips the baby item. Queued as `kActorLoaded` it
+inherited the equip gate in `ApplyItem` anyway, so a recorded pregnancy for an NPC
+in Whiterun waited for the player to walk to Whiterun. The new trigger has no world
+precondition and is released only by the settle pass's **final** round and by a
+game load — the final round, because releasing it earlier would put it back in
+front of the churn it was moved behind.
+
+Deferral is no longer reported at enqueue time by any category. It cannot be:
+`ReportSink::ClaimBucket` allows one bucket per item id for the whole run, so a
+`Deferred` claim written when the item was queued could never be corrected to
+`Succeeded` when the settle landed it forty milliseconds later.
+`DeferredRestoreManager::ReportRemaining` is the single voice, run after the pass,
+over whatever genuinely survived — with each category's real reason kept in the
+`RemainingNotice` table rather than lost to a generic sentence. The knock-on is
+that `EndCategory`'s derived status is now honest: a category whose deferrals all
+landed reads `kOk` instead of `kPartial`.
 
 ### Validation
 
@@ -200,8 +249,7 @@ Implemented for the categories whose values can honestly be read back:
 | `player.identity` | name, only when `bRestoreName=1` | yes |
 | `player.skills` | both stores, ±1 tolerance | yes |
 | `player.level` | level | yes |
-| `player.level` | perk points | **no** — perks bought after the level write spend them legitimately |
-| `player.perks` | `HasPerk` over the recorded playable set | yes |
+| `player.level` | perk points, against the level rather than the snapshot | **no** — the player can spend one before the read-back |
 | `player.spells_shouts` | `HasSpell` / `HasShout`; abilities excluded | yes |
 | `player.currency` | gold count | yes |
 | `player.inventory` | that the chunked walk reached the end of the list | yes |
@@ -290,13 +338,13 @@ One table, in one file. The membership test is: *if this category alone failed,
 would playing on give the player a character that is permanently wrong, with no
 way to fix it by playing?*
 
-Critical: `player.identity`, `player.skills`, `player.level`, `player.perks`,
+Critical: `player.identity`, `player.skills`, `player.level`,
 `player.spells_shouts`, `player.attributes`, `player.attributes_reassert`,
 `player.currency`, `player.inventory`, `player.equipment`, and `_orchestrator`
 (a phase abandoned mid-way is by definition a partial write). They run as a
-dependency chain — skills gate perks, level gates perk availability — and half a
-chain applied cannot be repaired by playing, while the co-save flag means the
-import will not be offered again.
+dependency chain — skills gate the level write, and the level sets how many perk
+points the character arrives with — and half a chain applied cannot be repaired by
+playing, while the co-save flag means the import will not be offered again.
 
 Everything else is harmless: every per-NPC category, everything cosmetic, and
 everything that reaches into another mod. Those fail routinely against a load
@@ -369,9 +417,9 @@ restore in progress. Cleared in `Finish` now.
 - `papyrus/ModProbe` — plugin / script / DLL probes, resolved once.
 - `papyrus/SaveMigrationApi` + `SaveMigrationDebug.psc` — 7 debug natives.
 
-### Categories (33 registered — the plan's full set, plus cleared locations and VR Editor's files)
+### Categories (32 registered — the plan's full set minus perks, plus cleared locations and VR Editor's files)
 `system.load_order`, `npc.roster`, `player.identity`, `player.skills`,
-`player.level`, `player.perks`, `player.beast_form`, `player.spells_shouts`,
+`player.level`, `player.beast_form`, `player.spells_shouts`,
 `player.attributes`, `player.currency`, `player.inventory`, `player.equipment`,
 `player.map_markers`, `world.cleared_locations`, `player.location`,
 `npc.wait_state`, `npc.relationship`, `npc.inventory`, `npc.equipment`,
@@ -386,12 +434,20 @@ hands), used by both the player and every NPC.
 - Gold is a **delta**, never an inventory item — a repeated restore cannot double it.
 - Skills write **both** stores (`PlayerSkills::Data` and `avStorage`), with
   `bVerifySkillMirror` reading them back and reporting `W_SKILL_MIRROR_ASYMMETRIC`.
-- `perkCount` is written verbatim, never derived.
+- `perkCount` is **derived from the level**, one point per level, and the snapshot's
+  own banked count is recorded but never applied. Perks are not migrated: the trees
+  they came from are not the trees they would land in.
 - Relationship rank handles the **inversion** (`papyrusRank = 4 - level`) and caps at
   Ally unless `bAllowLoverRank=1`; falls back to VM dispatch plus read-back
   verification when no record exists.
-- NPC inventory is **eager**, NPC equipment is **deferred** — because
-  `AddObjectToContainer` needs no 3D and `EquipObject` silently no-ops without it.
+- NPC inventory is **eager**, NPC equipment is **attempt-then-verify** — because
+  `AddObjectToContainer` needs no 3D and `EquipObject` is widely said to no-op
+  without it. Widely *said*: `EquipObject` returns void, so nothing here had ever
+  measured it. Every recorded item is now equipped and read back through
+  `EquipmentCommon::IsWorn`, which reads `ExtraWorn` / `ExtraWornLeft` off the
+  inventory entry and therefore answers for an actor with no 3D at all. Only what
+  fails to confirm is queued, and the queued payload is rebuilt from just those
+  keys, so the replay does not re-walk the slots that already landed.
 - Map marker flags are re-asserted on **every** `kPostLoadGame`, making `.ess`
   persistence of `ExtraMapMarker` irrelevant to correctness.
 - The harvest **waits for the Papyrus VM** and gives categories a chance to
@@ -494,12 +550,17 @@ independently of this project — it was losing user data.
 2. **`PlayerAttributes` is split into three registered categories** — `PlayerLevel`
    (`kProgression`), `PlayerAttributes` (`kEconomy`) and `PlayerAttributesReassert`
    (`kFollowers`) — all in `PlayerAttributes.{h,cpp}`. The plan's file list has one
-   entry, but its apply order requires perks and spells to land *between* the level
+   entry, but its apply order requires spells and equipment to land *between* the level
    write and the health/magicka/stamina write, which one category cannot express.
 
-3. **`bRestoreQuestPerks` added to `[Restore]`.** The plan's prose requires
-   quest-granted perks to be "recorded but default OFF" but its INI block has no key
-   for it.
+3. **Perks are not migrated, and `bRestoreQuestPerks` is gone with them.** The plan
+   asked for perks to be restored, with quest-granted ones behind a switch. Measured on
+   a real load order (2159 plugins, 1817 PERK records): of 183 perks the character held,
+   15 had been bought from a skill tree. The rest were quest flags and mod bookkeeping.
+   No perk-record flag separates the two — the best combination still waves through 192
+   junk perks across the load order — and the only signal that does, skill-tree
+   membership, describes the *exporting* install's trees rather than the importing one's.
+   `PlayerLevel` grants one point per level instead.
 
 4. **`WellKnownForms` resolves vanilla forms three ways** (INI override → editor ID →
    documented FormID, type-checked). Only `CurrentFollowerFaction` (`0x0005C84E`) is
@@ -621,6 +682,21 @@ the log line names.
 
 Everything in "The player-facing flow" above compiles and deploys, and **none of
 it has been run in game.** In particular:
+
+- **Whether `EquipObject` does anything for an actor with no 3D.** This has been
+  asserted in a comment since the first commit and never measured. It is now the
+  one question the code answers *for itself*: `npc.equipment` attempts the equip
+  regardless and reports `verified` against `unconfirmed` per item, and the settle
+  pass reports how many of the unconfirmed then landed once the followers arrived.
+  The first real import's report answers it — and if the answer turns out to be
+  "yes, it works unloaded", the whole deferred path for equipment becomes a
+  fallback that almost never fires, which is exactly the shape it is now written
+  in. Nothing depends on which way it goes.
+- **The settle pass's round count and spacing.** 6 × 400 ms is a guess at how long
+  a moved follower takes to become equippable. The log line
+  `settle round N of M retired K item(s)` is what tunes it: if round 1 is always
+  the productive one, the defaults are generous; if the productive round is
+  consistently the last, they are too tight.
 
 - **Both prompt chains.** The export pair and the import pair have never been
   shown. The thing to watch is `PromptGate`: if `SaveMigration.log` reports

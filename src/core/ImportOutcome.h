@@ -19,8 +19,9 @@ namespace SaveMigration::Core {
 ///
 /// What does make it unsafe is a *player progression* category failing wholesale
 /// partway through, because those categories run in a dependency chain: skills
-/// gate perks, level gates perk availability, perks gate attributes. Half of that
-/// chain applied is a character that cannot be repaired by playing on, and the
+/// gate the level write, and the level sets how many perk points the character
+/// arrives with. Half of that chain applied is a character that cannot be
+/// repaired by playing on, and the
 /// co-save flag means it will not be offered again. That is the case worth
 /// spending an alarming message box on, and nothing else is.
 struct ImportOutcome {

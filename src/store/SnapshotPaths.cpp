@@ -128,14 +128,12 @@ fs::path SnapshotPaths::RestoreReceipt(const fs::path& snapshotDir) {
 }
 
 fs::path SnapshotPaths::ReportOutputDir() {
-    auto dir = LogDirectory();
-    if (dir.empty()) {
-        // Falling back into the snapshot root is worse for discoverability but
-        // better than losing the report entirely.
-        spdlog::warn("SnapshotPaths: no SKSE log directory; reports go under the snapshot root");
-        return Root() / "reports";
-    }
-    return dir / "SaveMigration";
+    // Under the game's Data folder, never under <Documents>\My Games. With MO2 the
+    // whole tree is virtualised, so a write here lands in the instance's own
+    // overwrite\ - which is the profile the report actually describes. The SKSE log
+    // directory is shared by every instance on the machine, so reports written
+    // there from two modlists overwrite each other's `latest_*`.
+    return Root() / "reports";
 }
 
 fs::path SnapshotPaths::PendingDbMarker() { return Root() / "pending_skyrimnet_db.json"; }

@@ -30,7 +30,7 @@ public:
         std::filesystem::path jsonPath;
     };
 
-    /// `<Documents>/My Games/Skyrim VR/SKSE/SaveMigration/`:
+    /// `Data/SKSE/Plugins/SaveMigration/reports/` (MO2: the instance's `overwrite\`):
     ///   `export_report_<saveId>_<ts>.{txt,json}` (or `import_report_...`)
     ///   plus `latest_export_report.txt` / `latest_import_report.txt`.
     ///

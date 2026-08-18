@@ -20,6 +20,10 @@ namespace SaveMigration::Report {
 class ReportSink {
 public:
     /// Scopes every subsequent call to a category until the next `BeginCategory`.
+    ///
+    /// Re-opening an id **resumes** that category's row and keeps accumulating
+    /// into it; it does not start a second one. Callers that want a row of their
+    /// own must pass an id of their own.
     void BeginCategory(std::string_view id, std::string_view displayName, int phase);
 
     /// Declares the current category unavailable or disabled. `skipped` is
@@ -90,6 +94,10 @@ private:
     MigrationReport m_report;
     /// Index into m_report.categories, or npos when no category is open.
     size_t m_current = static_cast<size_t>(-1);
+    /// INI-held-back items in the open category, folded into one note by
+    /// `EndCategory` rather than emitted one entry each.
+    uint32_t m_iniSkippedItems = 0;
+    std::string m_iniSkipExample;
     std::unordered_map<std::string, Bucket> m_itemBuckets;
     std::unordered_map<std::string, size_t> m_subjectIndex;
     /// categoryId -> forced status, so EndCategory does not overwrite a

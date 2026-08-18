@@ -20,9 +20,14 @@ namespace SaveMigration::Categories {
 /// only the fast path: the applier then **re-reads `GetActorAddon` and compares
 /// FormKeys**, sweeping indices if the name match landed wrong.
 ///
-/// The INI is never written directly. TNG's `SaveMainIni` rewrites the whole file
-/// from memory on every `kSaveGame`, so a direct write would be discarded at the next
-/// save.
+/// This category goes through TNG's API rather than its INI, because the API is
+/// what gets the keywords and the 3D refresh right. The file is written too, by
+/// `system.tng_settings`, as the fallback for when TNG's Papyrus half is absent -
+/// and that write survives: `Inis::SaveMainIni` calls `LoadFile` before it stores
+/// anything, so it merges rather than replacing, and `SaveIniPairs` only touches
+/// the keys TNG itself holds in memory. What it does overwrite is an entry for an
+/// actor TNG has already loaded this session, which is the other reason the API
+/// route is the primary one.
 /// **The capture is primed, not dispatched from `CollectActor`.** TNG answers
 /// only through Papyrus, and the harvest is one game-thread task — a call made
 /// inside it cannot answer before it ends. Dispatching from the collector wrote

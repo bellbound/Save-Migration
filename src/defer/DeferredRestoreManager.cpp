@@ -35,6 +35,47 @@ namespace {
 /// deferred replay, and it defaults to 200.
 constexpr uint32_t kMaxAppliesPerDrain = 8;
 
+/// The player-facing sentence for an item still on the queue when the import ends.
+///
+/// One table rather than a line each category writes at enqueue time, because at
+/// enqueue time nobody knows yet whether the item will survive the settle pass -
+/// and `ReportSink::ClaimBucket` allows one bucket per item id for the whole run,
+/// so a premature "this is waiting" could never be corrected to "this landed".
+///
+/// Keyed by category id, with a default that is true of all of them, so a new
+/// deferring category reports something sensible without an edit here.
+std::string_view RemainingNotice(std::string_view categoryId) {
+    if (categoryId == "npc.equipment") {
+        return "the engine took the equip and the item did not read back as worn, which is what an "
+               "unrendered actor looks like, so their gear goes on when you next see them";
+    }
+    if (categoryId == "npc.obody_preset") {
+        return "their preset key is already written; the morph itself needs the body rendered, and "
+               "ORefit derives clothing morphs from worn slot 32, so it lands the first time you "
+               "see them";
+    }
+    if (categoryId == "npc.outfit_vr_dressup") {
+        return "the outfit is already in VR Dress Up's storage; the equip waits until they load so "
+               "ApplyOutfit cannot prune it against an unfilled inventory";
+    }
+    if (categoryId == "npc.home_mhiyh") {
+        return "MHIYH's free alias is kLoadedOnly, so filling it for an unloaded actor would "
+               "silently do nothing - it is assigned when you next see them";
+    }
+    if (categoryId == "npc.skyrimnet_accompany") {
+        return "SkyrimNet's follow package is registered when they load: registering a package "
+               "changes AI, so it has to be the last thing done to them";
+    }
+    if (categoryId == "npc.fertility") {
+        return "their Fertility Mode faction rank is re-asserted on the next load";
+    }
+    if (categoryId == "npc.tng") {
+        return "the TNG addon waits for the player's 3D and for TNG's own post-load pass, so we "
+               "are the last writer";
+    }
+    return "it is applied when you next see them";
+}
+
 }  // namespace
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -258,18 +299,24 @@ void DeferredRestoreManager::OnGameLoaded() {
     // regardless of where the player is, so counting it would retire the whole
     // queue after `maxAttempts` loads without a single subject having been seen -
     // discarding precisely the work that is waiting for the player to travel.
-    Signal(ReadySignal{std::string{}, 0, /*matchAll=*/true, /*countsAsAttempt=*/false});
+    // `releaseImmediate`: a load is a perfectly good moment for work whose only
+    // gate was "after the equipment churn", and the churn it was ordered behind
+    // finished in the session that queued it.
+    Signal(ReadySignal{std::string{}, 0, /*matchAll=*/true, /*countsAsAttempt=*/false,
+                       /*releaseImmediate=*/true});
 }
 
 void DeferredRestoreManager::ForceDrain() {
     // The debug native. Ignores the trigger mask entirely, and for the same
     // reason as the load path it does not consume attempts: a tester poking the
     // queue should not be able to exhaust it.
-    Signal(ReadySignal{std::string{}, 0xFF, /*matchAll=*/true, /*countsAsAttempt=*/false});
+    Signal(ReadySignal{std::string{}, 0xFF, /*matchAll=*/true, /*countsAsAttempt=*/false,
+                       /*releaseImmediate=*/true});
 }
 
 bool DeferredRestoreManager::ApplyItem(PendingItem& item, Report::ReportSink& sink,
-                                       bool countsAsAttempt, bool& didWork) {
+                                       bool countsAsAttempt, bool releaseImmediate,
+                                       bool& didWork) {
     didWork = false;
     auto* category = Core::CategoryRegistry::Get().FindActor(item.categoryId);
     if (!category) {
@@ -313,6 +360,14 @@ bool DeferredRestoreManager::ApplyItem(PendingItem& item, Report::ReportSink& si
             ++item.attempts;
         }
         return false;  // retry on the next trigger
+    }
+
+    // The other gate, and it is not a world condition: a `kImmediate` item is
+    // waiting on a *position in the run*, not on the actor. Never charges an
+    // attempt, because "the settle pass has not reached its last round yet" is not
+    // a chance the item has had and wasted.
+    if (item.WantsTrigger(Trigger::kImmediate) && !releaseImmediate) {
+        return false;
     }
 
     Model::ActorSubject subject;
@@ -384,15 +439,51 @@ void DeferredRestoreManager::Drain() {
         std::lock_guard lock(m_readyMutex);
         ready.swap(m_ready);
     }
-    if (ready.empty()) {
+    if (ready.empty() || PendingWorkQueue::Get().Empty()) {
+        // The emptiness check is before the sink, not inside `DrainPass`: creating
+        // the supplement sink for a drain with nothing to drain would arm
+        // `WriteSupplement` to eventually emit an empty report.
         return;
     }
+
+    // The supplement sink, shared across every event-driven drain, so the report it
+    // eventually writes describes the whole deferred lifetime rather than one pass.
+    std::shared_ptr<Report::ReportSink> sink;
+    {
+        auto* calendar = RE::Calendar::GetSingleton();
+        const float gameDays = calendar ? calendar->GetDaysPassed() : 0.0f;
+        std::lock_guard lock(m_supplementMutex);
+        if (!m_supplementSink) {
+            m_supplementSink = std::make_shared<Report::ReportSink>();
+            m_supplementSink->SetHeader("import", "", "", "", "", gameDays, 0);
+        }
+        sink = m_supplementSink;
+    }
+
+    DrainPass(ready, *sink, /*isSupplement=*/true);
+}
+
+DeferredRestoreManager::DrainOutcome DeferredRestoreManager::DrainNow(Report::ReportSink& sink,
+                                                                     bool releaseImmediate) {
+    // A synthetic signal rather than whatever the sinks happen to have observed:
+    // the settle pass is not reacting to a world event, it is asserting "now is the
+    // moment, test everything". No attempt is charged for the same reason the load
+    // kick charges none - the subject may be nowhere near the player and never had
+    // a chance to be ready.
+    const std::vector<ReadySignal> ready{ReadySignal{std::string{}, 0xFF, /*matchAll=*/true,
+                                                     /*countsAsAttempt=*/false, releaseImmediate}};
+    return DrainPass(ready, sink, /*isSupplement=*/false);
+}
+
+DeferredRestoreManager::DrainOutcome DeferredRestoreManager::DrainPass(
+    const std::vector<ReadySignal>& ready, Report::ReportSink& sink, bool isSupplement) {
+    DrainOutcome outcome;
 
     auto& queue = PendingWorkQueue::Get();
     uint64_t generationAtStart = 0;
     auto items = queue.Items(generationAtStart);
     if (items.empty()) {
-        return;
+        return outcome;
     }
 
     // An empty key from the load/force path means "consider everything".
@@ -404,8 +495,13 @@ void DeferredRestoreManager::Drain() {
     uint8_t globalTriggers = 0;
     bool globalMatchAll = false;
     bool globalCounts = false;
+    // Not per key: releasing the immediate items is a statement about the run's
+    // position, not about any one subject, so any signal asking for it asks for all
+    // of them.
+    bool releaseImmediate = false;
     std::unordered_map<std::string, std::pair<uint8_t, bool>> perKey;
     for (const auto& signal : ready) {
+        releaseImmediate |= signal.releaseImmediate;
         if (signal.key.empty()) {
             globalTriggers |= signal.triggers;
             globalMatchAll |= signal.matchAll;
@@ -426,16 +522,6 @@ void DeferredRestoreManager::Drain() {
 
     auto* calendar = RE::Calendar::GetSingleton();
     const float gameDays = calendar ? calendar->GetDaysPassed() : 0.0f;
-
-    std::shared_ptr<Report::ReportSink> sink;
-    {
-        std::lock_guard lock(m_supplementMutex);
-        if (!m_supplementSink) {
-            m_supplementSink = std::make_shared<Report::ReportSink>();
-            m_supplementSink->SetHeader("import", "", "", "", "", gameDays, 0);
-        }
-        sink = m_supplementSink;
-    }
 
     std::vector<PendingItem> survivors;
     survivors.reserve(items.size());
@@ -477,19 +563,19 @@ void DeferredRestoreManager::Drain() {
 
         // Expiry before work: a stale item should not touch the world.
         if (item.expiresAtGameTime > 0.0f && gameDays > item.expiresAtGameTime) {
-            sink->BeginCategory(item.categoryId, item.categoryId, 0);
-            sink->Failed(Report::SystemSubject(item.subjectFormKey), item.subjectFormKey,
-                         Report::ReasonCode::kDeferredExpired,
-                         std::format("passed its game-day deadline of {:.2f}",
-                                     item.expiresAtGameTime));
-            sink->EndCategory();
+            sink.BeginCategory(item.categoryId, item.categoryId, 0);
+            sink.Failed(Report::SystemSubject(item.subjectFormKey), item.subjectFormKey,
+                        Report::ReasonCode::kDeferredExpired,
+                        std::format("passed its game-day deadline of {:.2f}",
+                                    item.expiresAtGameTime));
+            sink.EndCategory();
             ++retired;
             m_anythingRetired = true;
             continue;
         }
 
         bool didWork = false;
-        const bool retire = ApplyItem(item, *sink, counts, didWork);
+        const bool retire = ApplyItem(item, sink, counts, releaseImmediate, didWork);
         if (didWork) {
             ++worked;
         }
@@ -500,12 +586,12 @@ void DeferredRestoreManager::Drain() {
         }
 
         if (item.attempts >= item.maxAttempts) {
-            sink->BeginCategory(item.categoryId, item.categoryId, 0);
-            sink->Failed(Report::SystemSubject(item.subjectFormKey), item.subjectFormKey,
-                         Report::ReasonCode::kDeferredExhausted,
-                         std::format("{} attempt(s) without the subject becoming ready",
-                                     item.attempts));
-            sink->EndCategory();
+            sink.BeginCategory(item.categoryId, item.categoryId, 0);
+            sink.Failed(Report::SystemSubject(item.subjectFormKey), item.subjectFormKey,
+                        Report::ReasonCode::kDeferredExhausted,
+                        std::format("{} attempt(s) without the subject becoming ready",
+                                    item.attempts));
+            sink.EndCategory();
             ++retired;
             m_anythingRetired = true;
             continue;
@@ -518,26 +604,81 @@ void DeferredRestoreManager::Drain() {
     // from a copy taken before the pass began.
     queue.CommitDrain(std::move(survivors), processed, generationAtStart);
 
-    if (deferredRemainder) {
+    outcome.retired = retired;
+    outcome.worked = worked;
+    outcome.remaining = queue.Size();
+    outcome.budgetHit = deferredRemainder;
+
+    if (deferredRemainder && isSupplement) {
         // Re-arm for the next frame. `matchAll` so the carried-over items are
         // reconsidered without needing the world event to happen again, and no
         // attempt charged, because they were never tried.
+        //
+        // Only on the event path: a settle-pass drain reports `budgetHit` to its
+        // caller instead, which is already running rounds and would otherwise get a
+        // second, competing drain scheduled behind it - writing into the supplement
+        // sink rather than into the import report.
         spdlog::debug("DeferredRestoreManager: budget of {} reached, {} item(s) carried to the "
                       "next frame",
-                      budget, queue.Size());
-        Signal(ReadySignal{std::string{}, 0xFF, /*matchAll=*/true, /*countsAsAttempt=*/false});
+                      budget, outcome.remaining);
+        Signal(ReadySignal{std::string{}, 0xFF, /*matchAll=*/true, /*countsAsAttempt=*/false,
+                           /*releaseImmediate=*/releaseImmediate});
     }
 
     if (retired > 0) {
         spdlog::info("DeferredRestoreManager: retired {} item(s), {} remaining", retired,
-                     queue.Size());
+                     outcome.remaining);
     }
 
-    if (queue.Empty() && m_anythingRetired) {
+    if (isSupplement && queue.Empty() && m_anythingRetired) {
         // Queue empty -> sinks go inert (they short-circuit on Empty()) and the
-        // supplement report is written.
+        // supplement report is written. Never from the settle pass: its lines went
+        // into the import report, and a supplement naming the same items again
+        // would read as a second, later round of work that never happened.
         WriteSupplement();
     }
+    return outcome;
+}
+
+uint32_t DeferredRestoreManager::ReportRemaining(Report::ReportSink& sink) {
+    const auto items = PendingWorkQueue::Get().Items();
+    if (items.empty()) {
+        return 0;
+    }
+
+    for (const auto& item : items) {
+        // The subject is named from the live actor where it resolves, because
+        // "Lydia" is what the player can act on and the form key is not. An
+        // unresolvable one still gets a line: it is on the queue either way, and
+        // the drain is where it gets retired for being unresolvable.
+        Report::ReasonCode reason = Report::ReasonCode::kNone;
+        auto* actor = Model::FormResolver::Get().ResolveChecked<RE::Actor>(item.subjectFormKey,
+                                                                          reason);
+        const char* name = actor ? actor->GetName() : nullptr;
+        const auto displayName = (name && *name) ? Util::ConvertSkyrimTextToUTF8(name)
+                                                 : item.subjectFormKey;
+
+        // Resumes the row the apply pass already opened for this category, which is
+        // where these lines belong. The name and phase are only consulted when no
+        // row exists - a queue item from a session whose build had a category this
+        // one does not - so they are looked up rather than invented.
+        auto* category = Core::CategoryRegistry::Get().FindActor(item.categoryId);
+        std::string_view displayNameForRow = item.categoryId;
+        int phaseForRow = Core::PhaseValue(Core::Phase::kSettle);
+        if (category) {
+            const auto& descriptor = category->Describe();
+            displayNameForRow = descriptor.displayName;
+            phaseForRow = Core::PhaseValue(descriptor.phase);
+        }
+        sink.BeginCategory(item.categoryId, displayNameForRow, phaseForRow);
+        sink.Deferred(Report::SubjectRef{Report::SubjectKind::kActor, item.subjectFormKey,
+                                        displayName},
+                      std::format("{}/{}", item.subjectFormKey, item.categoryId),
+                      std::format("'{}' was not reachable during the import - {}", displayName,
+                                  RemainingNotice(item.categoryId)));
+        sink.EndCategory();
+    }
+    return static_cast<uint32_t>(items.size());
 }
 
 void DeferredRestoreManager::WriteSupplement() {

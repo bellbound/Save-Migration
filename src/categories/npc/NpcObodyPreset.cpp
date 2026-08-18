@@ -208,14 +208,18 @@ void NpcObodyPreset::ApplyActor(const Model::ActorSubject& subject, Core::ApplyC
     if (!subject.actor) {
         return;
     }
+    // `is_object` first. `CollectActor` writes no entry at all for an actor OBody
+    // has never rendered - which is most of a roster - and `ActorPayload` hands
+    // back a null json for those. `value()` on a null throws type_error.306, and
+    // that throw used to abort the category for every actor after this one.
     const auto& payload = ctx.ActorPayload(kId, subject.refKey);
+    if (!payload.is_object()) {
+        return;
+    }
     const auto preset = payload.value("preset", std::string{});
     if (preset.empty()) {
         return;
     }
-
-    const Report::SubjectRef subjectRef{Report::SubjectKind::kActor, subject.refKey,
-                                        subject.displayName};
 
     // The *key* is written now, before anything generates a body - that is the whole
     // point of this phase. The visible morph application is deferred to after the
@@ -233,11 +237,15 @@ void NpcObodyPreset::ApplyActor(const Model::ActorSubject& subject, Core::ApplyC
     item.maxAttempts = 8;
     item.payload = Util::SafeDump(payload);
     if (ctx.pending.Enqueue(std::move(item))) {
-        ctx.report.Deferred(subjectRef, std::format("{}/obody", subject.refKey),
-                            std::format("preset key for '{}' written now; the morph application "
-                                        "waits until the final outfit and skin are on, because "
-                                        "ORefit derives clothing morphs from worn slot 32",
-                                        subject.displayName));
+        // No report line for the queueing itself. The import's settle pass runs
+        // after the followers have been brought to the player, and it drains most of
+        // this queue before the run ends - so a line written here would claim the
+        // morph is waiting before anyone knows whether it is, and `ClaimBucket`
+        // allows one bucket per item id for the whole run, so it could never be
+        // corrected. `DeferredRestoreManager::ReportRemaining` says it, for whatever
+        // genuinely survives, and carries this same reason.
+        spdlog::debug("NpcObodyPreset: morph for '{}' queued behind the final outfit and skin",
+                      subject.displayName);
     }
 }
 
@@ -246,6 +254,9 @@ bool NpcObodyPreset::ApplyDeferred(const Model::ActorSubject& subject, Core::App
         return false;
     }
     const auto& payload = ctx.ActorPayload(kId, subject.refKey);
+    if (!payload.is_object()) {
+        return true;  // nothing recorded for this actor; see ApplyActor
+    }
     const auto preset = payload.value("preset", std::string{});
     if (preset.empty()) {
         return true;

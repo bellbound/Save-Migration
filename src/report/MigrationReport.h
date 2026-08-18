@@ -151,6 +151,10 @@ struct MigrationReport {
 
     std::vector<std::string> missingPlugins;
     std::vector<std::string> addedPlugins;
+    /// Categories switched off in the INI, as "id - why". Collected here rather
+    /// than pushed as entries: the fact worth reading is *which categories* are
+    /// off, and one line per skipped item inside them said nothing else.
+    std::vector<std::string> iniDisabledCategories;
     std::vector<CategoryRollup> categories;
     std::vector<SubjectRollup> subjects;
     std::vector<ReportEntry> entries;

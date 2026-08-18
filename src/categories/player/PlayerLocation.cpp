@@ -129,8 +129,24 @@ void PlayerLocation::Apply(Core::ApplyContext& ctx) {
         return;
     }
 
+    // Read back rather than assume. `MoveRefTo` wraps a void engine call, so its
+    // `true` only ever meant "the arguments passed the sanity checks and the call
+    // was made" - it could never mean the player arrived, and this line reported a
+    // success either way. `MoveTo` sets the parent cell within the call, so asking
+    // now is meaningful.
+    auto* landedCell = player->GetParentCell();
+    const char* landedName = landedCell ? landedCell->GetName() : nullptr;
     spdlog::info("PlayerLocation: the move returned; the player is in '{}'",
-                 cellName.empty() ? cellKey : cellName);
+                 (landedName && *landedName) ? landedName : "an unnamed cell");
+
+    if (cell && landedCell != cell) {
+        ctx.report.Failed(
+            subject, "player_location", Report::ReasonCode::kValidationMismatch,
+            std::format("the move to '{}' was made but the player is in '{}' afterwards",
+                        cellName.empty() ? cellKey : cellName,
+                        (landedName && *landedName) ? landedName : "an unnamed cell"));
+        return;
+    }
 
     // There is deliberately no `CenterOnCell` here. It reads like a harmless
     // "and make that the current cell", but it is the console's own `coc`
@@ -162,6 +178,38 @@ void PlayerLocation::Apply(Core::ApplyContext& ctx) {
                 "now occupies the recorded spot.");
         }
     }
+}
+
+void PlayerLocation::Validate(Core::ApplyContext& ctx) {
+    const auto& payload = ctx.Payload(kId);
+    auto* player = ctx.player;
+    if (!player || !payload.is_object()) {
+        return;
+    }
+
+    const auto cellKey = payload.value("cell", std::string{});
+    const auto cellName = payload.value("cellName", std::string{});
+    if (cellKey.empty()) {
+        return;
+    }
+
+    // The apply pass checks the move landed; this checks it *stuck*. Between the
+    // two sit every later phase and every other mod reacting to a cell change -
+    // MHIYH re-placing home markers, a follower framework repositioning the party,
+    // an alias fill that fires on load - and any of them can move the player again.
+    // That difference is the whole reason validation is a separate pass.
+    auto* landed = player->GetParentCell();
+    const auto landedKey = Model::FormKeyUtil::BuildFormKey(landed);
+    if (Util::IEquals(landedKey, cellKey)) {
+        return;
+    }
+
+    const char* landedName = landed ? landed->GetName() : nullptr;
+    ctx.ReportValidation("player position",
+                         std::format("expected '{}' ({}), found '{}' ({})",
+                                     cellName.empty() ? cellKey : cellName, cellKey,
+                                     (landedName && *landedName) ? landedName : "unnamed",
+                                     landedKey.empty() ? "no cell" : landedKey));
 }
 
 }  // namespace SaveMigration::Categories

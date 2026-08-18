@@ -471,11 +471,19 @@ void NpcFertility::ApplyActor(const Model::ActorSubject& subject, Core::ApplyCon
 
     // The faction rank is re-asserted in phase 2, after the equipment churn, because
     // `unequipOthers` during an outfit apply can strip the baby item that goes with it.
+    //
+    // `kImmediate`, not `kActorLoaded`. The queue is being used here purely as an
+    // ordering device - "after the equipment" - and `AddToFaction` plus the
+    // `GetFactionRank` read-back below work perfectly on an actor in an unattached
+    // cell. Asking for `kActorLoaded` inherited the equip gate in
+    // `DeferredRestoreManager::ApplyItem` anyway, which meant a recorded pregnancy
+    // for an NPC on the other side of Skyrim waited for the player to walk there
+    // before doing a write that would have landed during the import.
     if (factionRank >= 0 && m_handles.effectsFaction && !dryRun) {
         Defer::PendingItem item;
         item.categoryId = std::string(kId);
         item.subjectFormKey = refKey;
-        item.trigger = Defer::TriggerBits(Defer::Trigger::kActorLoaded);
+        item.trigger = Defer::TriggerBits(Defer::Trigger::kImmediate);
         item.maxAttempts = 8;
         item.payload = Util::SafeDump(payload);
         ctx.pending.Enqueue(std::move(item));
@@ -516,6 +524,9 @@ bool NpcFertility::ApplyDeferred(const Model::ActorSubject& subject, Core::Apply
     }
 
     const auto& payload = ctx.ActorPayload(kId, subject.refKey);
+    if (!payload.is_object()) {
+        return true;  // an actor Fertility recorded nothing for; `value()` throws on the null
+    }
     const int32_t factionRank = payload.value("effectsFactionRank", -1);
     if (factionRank < 0) {
         return true;

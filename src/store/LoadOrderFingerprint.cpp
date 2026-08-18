@@ -108,10 +108,11 @@ LoadOrderFingerprint::Diff LoadOrderFingerprint::DiffAgainst(
         const auto* live = findLive(record.filename);
         if (!live) {
             diff.missing.push_back(record.filename);
-        } else if (live->fileSize != record.fileSize && record.fileSize != 0 &&
-                   live->fileSize != 0) {
-            diff.changed.push_back(record.filename);
         }
+        // File size is deliberately not compared. It changes whenever a mod is
+        // updated, which tells us nothing about whether a record this snapshot
+        // names has moved - and a form that has moved fails its own lookup, in
+        // front of the item the player was expecting.
     }
     for (const auto& record : m_current) {
         if (!inSnapshot(record.filename)) {
@@ -119,8 +120,8 @@ LoadOrderFingerprint::Diff LoadOrderFingerprint::DiffAgainst(
         }
     }
 
-    spdlog::info("LoadOrderFingerprint: diff - {} missing, {} added, {} changed",
-                 diff.missing.size(), diff.added.size(), diff.changed.size());
+    spdlog::info("LoadOrderFingerprint: diff - {} missing, {} added", diff.missing.size(),
+                 diff.added.size());
     return diff;
 }
 

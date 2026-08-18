@@ -118,8 +118,8 @@ const Core::CategoryDescriptor& PlayerLevel::Describe() const {
     static const Core::CategoryDescriptor descriptor{
         .id = kLevelId,
         .displayName = "Level and perk points",
-        // After skills (which can trip level-up bookkeeping), before perks (whose
-        // availability is gated on level).
+        // After skills, which can trip the engine's level-up bookkeeping and so
+        // would move the level out from under this write.
         .phase = Core::Phase::kProgression,
         .restoreMode = Core::RestoreMode::kInstant,
         .requirement = {},
@@ -139,12 +139,14 @@ void PlayerLevel::Collect(Core::CollectContext& ctx) {
     auto& payload = ctx.Payload(kLevelId, Describe().schemaVersion);
     payload["level"] = player->GetLevel();
     payload["baseDataLevel"] = base->actorData.level;
-    // perkCount is recorded verbatim and never derived from the perk list: a
-    // derived value would silently spend or refund points the user had banked.
+    // Recorded, but not what the import writes - see `Apply`. It is kept because
+    // it is the one number that says how much of this character's progression was
+    // still unspent, which the report is worth showing even though nothing acts
+    // on it.
     payload["perkCount"] = player->GetGameStatsData().perkCount;
 
     ctx.report.Succeeded(Report::PlayerSubject(), "player_level", "",
-                         std::format("level {}, {} perk point(s)", player->GetLevel(),
+                         std::format("level {}, {} perk point(s) unspent", player->GetLevel(),
                                      player->GetGameStatsData().perkCount));
 }
 
@@ -179,15 +181,29 @@ void PlayerLevel::Apply(Core::ApplyContext& ctx) {
     base->actorData.level = static_cast<uint16_t>(level);
     base->AddChange(RE::TESNPC::ChangeFlags::kBaseData);
 
-    player->GetGameStatsData().perkCount =
-        static_cast<int8_t>(std::clamp<int>(payload.value("perkCount", 0), 0, 127));
+    // Perk points come from the level; perks themselves are not migrated at all.
+    // Which perks a character could have bought is a fact about the *exporting*
+    // load order's trees, and the importing one is usually a different overhaul -
+    // so a carried perk is at best unbuyable here, and at worst a mod's hidden
+    // bookkeeping perk standing for a state this character has not reached.
+    //
+    // One per level, deliberately, rather than the vanilla earn rate of one per
+    // level-*up*, which is one fewer. The spare point costs less than explaining
+    // the off-by-one. Clamped because `perkCount` is an int8_t.
+    const int grantedPoints = std::clamp<int>(static_cast<int>(level), 0, 127);
+    player->GetGameStatsData().perkCount = static_cast<int8_t>(grantedPoints);
 
     ctx.report.Succeeded(subject, "player_level", "",
                          std::format("level {} (was {}), {} perk point(s)", level, previousLevel,
-                                     static_cast<int>(player->GetGameStatsData().perkCount)));
+                                     grantedPoints));
     ctx.report.Info(
         "level was written directly rather than via AdvanceLevel, which would play the level-up "
         "music and queue one attribute prompt per level.");
+    ctx.report.Info(std::format(
+        "perks were not carried across. This character got {} perk point(s) - one per level - to "
+        "spend in this install's own perk trees, which are not the trees the snapshot was taken "
+        "from. The snapshot recorded {} unspent point(s) on top of the perks that had been bought.",
+        grantedPoints, std::clamp<int>(payload.value("perkCount", 0), 0, 127)));
 }
 
 void PlayerLevel::Validate(Core::ApplyContext& ctx) {
@@ -208,10 +224,12 @@ void PlayerLevel::Validate(Core::ApplyContext& ctx) {
                                                   actualLevel));
     }
 
-    // Perk points, on the other hand, move legitimately: perks applied after the
-    // level write can spend them. Reported as soft for exactly that reason -
-    // worth showing, never grounds for telling the player to go back.
-    const auto wantedPerks = std::clamp<int>(payload.value("perkCount", 0), 0, 127);
+    // Perk points are checked against the level, not against the snapshot's
+    // banked count, because that is what `Apply` granted. Soft: nothing this
+    // import runs spends a point any more, but the player can open the Perks
+    // menu between the write and the read-back, and having done so is not a
+    // reason to tell them their character is broken.
+    const auto wantedPerks = std::clamp<int>(static_cast<int>(wantedLevel), 0, 127);
     const int actualPerks = player->GetGameStatsData().perkCount;
     if (actualPerks != wantedPerks) {
         ctx.ReportValidation("perk points",

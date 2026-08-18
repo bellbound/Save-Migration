@@ -3,6 +3,8 @@
 #include <format>
 #include <map>
 
+#include "model/FormKeyUtil.h"
+
 namespace SaveMigration::Categories {
 
 namespace {
@@ -68,11 +70,31 @@ void NpcRoster::Apply(Core::ApplyContext& ctx) {
                 ++unresolved;
                 // Reported individually: "which follower is missing" is exactly the
                 // question a user has when a restore looks thin.
+                //
+                // The two ways to be missing carry different advice, so they are
+                // told apart here rather than both being reported as "the NPC is
+                // gone, their plugin is probably absent". That blanket wording sent
+                // a player looking for an uninstalled mod when the plugin was
+                // installed and it was the key that was wrong.
+                auto reason = Report::ReasonCode::kSubjectUnresolvable;
+                std::string detail =
+                    std::format("'{}' could not be found in this save", entry.displayName);
+                if (const auto parsed = Model::FormKeyUtil::ParseFormKey(entry.refKey)) {
+                    if (!Model::FormKeyUtil::IsPluginLoaded(parsed->pluginName)) {
+                        reason = Report::ReasonCode::kSourcePluginMissing;
+                        detail = std::format("'{}' comes from '{}', which is not in this load order",
+                                             entry.displayName, parsed->pluginName);
+                    } else {
+                        reason = Report::ReasonCode::kFormLookupFailed;
+                        detail = std::format(
+                            "'{}' is recorded as {} and '{}' is loaded, but it holds no such record",
+                            entry.displayName, entry.refKey, parsed->pluginName);
+                    }
+                }
                 ctx.report.Failed(
                     Report::SubjectRef{Report::SubjectKind::kActor, entry.refKey, entry.displayName},
-                    std::format("roster/{}", entry.refKey), Report::ReasonCode::kSubjectUnresolvable,
-                    std::format("'{}' could not be found in this save", entry.displayName),
-                    entry.refKey, entry.displayName);
+                    std::format("roster/{}", entry.refKey), reason, detail, entry.refKey,
+                    entry.displayName);
             }
         }
     }

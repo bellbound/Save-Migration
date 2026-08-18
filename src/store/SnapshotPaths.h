@@ -117,8 +117,9 @@ public:
     static std::filesystem::path ReportsDir(const std::filesystem::path& snapshotDir);
     static std::filesystem::path RestoreReceipt(const std::filesystem::path& snapshotDir);
 
-    /// Reports live next to the plugin log, i.e.
-    /// `<Documents>/My Games/Skyrim VR/SKSE/SaveMigration/`.
+    /// Reports live under the game's Data folder, i.e.
+    /// `Data/SKSE/Plugins/SaveMigration/reports/` - which under MO2 means the
+    /// running instance's `overwrite\`, never `<Documents>/My Games`.
     static std::filesystem::path ReportOutputDir();
 
     /// Marker written by restore phase R1 telling the next `kPreLoadGame` that a

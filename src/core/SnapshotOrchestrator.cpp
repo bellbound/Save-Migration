@@ -424,20 +424,46 @@ void SnapshotOrchestrator::RunHarvest(std::string savePath) {
                 std::format("unavailable: missing {}",
                             Papyrus::ModProbe::Get().FirstMissing(descriptor.requirement)));
         } else {
-            try {
-                if (entry.global) {
+            if (entry.global) {
+                try {
                     entry.global->Collect(ctx);
-                } else {
-                    entry.actor->BeginCollect(ctx);
-                    entry.actor->CollectActor(playerSubject, ctx);
-                    for (const auto& subject : subjects) {
-                        entry.actor->CollectActor(subject, ctx);
-                    }
-                    entry.actor->EndCollect(ctx);
+                } catch (const std::exception& e) {
+                    sink->FailCategory(Report::ReasonCode::kIoError,
+                                       std::format("collector threw: {}", e.what()));
                 }
-            } catch (const std::exception& e) {
-                sink->FailCategory(Report::ReasonCode::kIoError,
-                                   std::format("collector threw: {}", e.what()));
+            } else {
+                // Per actor, so one unreadable subject costs that subject only.
+                // The apply side is contained the same way, and for the same
+                // reason: a category-wide try turns one bad actor into a whole
+                // category that reads as never attempted.
+                const auto collectOne = [&](const Model::ActorSubject& subject) {
+                    try {
+                        entry.actor->CollectActor(subject, ctx);
+                    } catch (const std::exception& e) {
+                        const char* name = subject.actor ? subject.actor->GetName() : nullptr;
+                        sink->Failed(Report::SubjectRef{Report::SubjectKind::kActor, subject.refKey,
+                                                        (name && *name) ? name : subject.refKey},
+                                     std::format("{}/{}", subject.refKey, descriptor.id),
+                                     Report::ReasonCode::kIoError,
+                                     std::format("collector threw for this actor: {}", e.what()));
+                    }
+                };
+                try {
+                    entry.actor->BeginCollect(ctx);
+                } catch (const std::exception& e) {
+                    sink->FailCategory(Report::ReasonCode::kIoError,
+                                       std::format("BeginCollect threw: {}", e.what()));
+                }
+                collectOne(playerSubject);
+                for (const auto& subject : subjects) {
+                    collectOne(subject);
+                }
+                try {
+                    entry.actor->EndCollect(ctx);
+                } catch (const std::exception& e) {
+                    sink->FailCategory(Report::ReasonCode::kIoError,
+                                       std::format("EndCollect threw: {}", e.what()));
+                }
             }
         }
         sink->EndCategory();

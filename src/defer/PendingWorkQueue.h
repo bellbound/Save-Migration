@@ -22,6 +22,21 @@ enum class Trigger : uint8_t {
     kCellFullyLoaded = 1 << 2,
     /// Kick on any game load, so a queue that survived a save still drains.
     kGameLoaded = 1 << 3,
+    /// **No world precondition at all.** The item is on the queue only to order it
+    /// after something else in the same run - not because the subject has to be
+    /// anywhere or be rendered.
+    ///
+    /// This exists because the 3D gate was being charged to work that never
+    /// needed it. `npc.fertility` queues a faction-rank re-assert so it lands
+    /// after the equipment churn (an outfit apply with `unequipOthers` strips the
+    /// baby item), and `AddToFaction` works perfectly on an actor in an unattached
+    /// cell. Queued with `kActorLoaded` it inherited the equip gate anyway, so a
+    /// pregnancy rank for an NPC in Whiterun waited until the player walked to
+    /// Whiterun to do a write that would have worked at import time.
+    ///
+    /// Released by the import's settle pass and by a game load, never by an
+    /// object-load or cell event - the point is that those are irrelevant to it.
+    kImmediate = 1 << 4,
 };
 
 [[nodiscard]] constexpr uint8_t TriggerBits(Trigger trigger) {

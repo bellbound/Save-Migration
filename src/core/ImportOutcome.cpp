@@ -15,9 +15,10 @@ namespace {
 /// playing?". That is why the list is exactly the player progression chain plus
 /// the orchestrator's own abort:
 ///
-///   - `player.skills`, `player.level`, `player.perks` run in that order and
-///     each gates the next. Skills missing under a restored level is a character
-///     whose perks were granted against thresholds that no longer hold.
+///   - `player.skills` and `player.level` run in that order and the first gates
+///     the second: writing a skill can trip the engine's level-up bookkeeping, so
+///     skills missing under a restored level is a character whose level and XP
+///     bar disagree and cannot be talked back into agreeing by playing.
 ///   - `player.spells_shouts` and `player.attributes` are written from the same
 ///     chain and are read by everything worn or cast afterwards.
 ///   - `_orchestrator` means a phase was abandoned mid-way, which is by
@@ -43,7 +44,6 @@ const std::unordered_set<std::string_view>& CriticalIds() {
         "player.identity",
         "player.skills",
         "player.level",
-        "player.perks",
         "player.spells_shouts",
         "player.attributes",
         "player.attributes_reassert",
@@ -126,7 +126,7 @@ std::string ImportOutcome::AlertText() const {
     if (nothingApplied) {
         return "Save Migration could not read the snapshot, so nothing was changed.\n\n"
                "This save is unaffected. See the report in\n"
-               "My Games\\Skyrim VR\\SKSE\\SaveMigration.";
+               "Data\\SKSE\\Plugins\\SaveMigration\\reports.";
     }
 
     if (IsUnsafe()) {
@@ -139,7 +139,7 @@ std::string ImportOutcome::AlertText() const {
         }
         text +=
             "\nDo NOT keep playing this save. Load the save you had before the import and try "
-            "again. The full report is in My Games\\Skyrim VR\\SKSE\\SaveMigration.";
+            "again. The full report is in Data\\SKSE\\Plugins\\SaveMigration\\reports.";
         return text;
     }
 

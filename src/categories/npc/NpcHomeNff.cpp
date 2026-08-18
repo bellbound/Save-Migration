@@ -244,10 +244,10 @@ void NpcHomeNff::EndApply(Core::ApplyContext& ctx) {
     auto* vars = Papyrus::PapyrusVariableInterface::GetSingleton();
     if (vars->SetVariable(m_handles.quest, std::string(kHomeScript), "nwsBaseTotal",
                           m_recordedBaseTotal, "Int")) {
-        ctx.report.Info(std::format(
-            "nwsBaseTotal set to {} after all {} resident assignment(s). Writing it first would "
-            "have made AddFollowerHome early-return and silently drop every assignment.",
-            m_recordedBaseTotal, m_assigned));
+        // Why this is written last is in the header and in the comment above; the
+        // report says what happened, not how the code is arranged.
+        ctx.report.Info(std::format("nwsBaseTotal set to {} after all {} resident assignment(s).",
+                                    m_recordedBaseTotal, m_assigned));
     } else {
         ctx.report.Warn(Report::ReasonCode::kVmVariableNotFound,
                         "nwsBaseTotal could not be written; NFF's MCM base count may read low");

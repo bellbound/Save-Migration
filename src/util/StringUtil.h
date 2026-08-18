@@ -49,6 +49,11 @@ std::vector<std::string> SplitAndTrim(std::string_view text, char delim = ',');
 /// list yields an empty string rather than a lone separator.
 std::string JoinStrings(const std::vector<std::string>& parts, std::string_view separator);
 
+/// `a, b, c, and 817 more`. For report lines that name a set which is usually
+/// small and occasionally enormous - a load order diff is either a handful of
+/// plugins or most of a modlist, and the second case must not print itself out.
+std::string JoinCapped(const std::vector<std::string>& parts, size_t maxNamed);
+
 /// Case-insensitive equality for plugin names, script names and editor IDs —
 /// all of which the engine treats case-insensitively.
 bool IEquals(std::string_view a, std::string_view b);

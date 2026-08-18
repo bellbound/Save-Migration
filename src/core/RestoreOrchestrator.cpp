@@ -10,9 +10,11 @@
 #include "core/PromptGate.h"
 #include "core/SaveIdentity.h"
 #include "core/Worker.h"
+#include "defer/DeferredRestoreManager.h"
 #include "defer/PendingWorkQueue.h"
 #include "model/FormRef.h"
 #include "papyrus/ModProbe.h"
+#include "papyrus/PapyrusInterface.h"
 #include "report/ReportSink.h"
 #include "report/ReportWriter.h"
 #include "store/SnapshotPaths.h"
@@ -30,6 +32,15 @@ namespace {
 /// A category that keeps asking for another frame without finishing is wedged.
 /// At 200 items per frame this is 200k items, far past any real inventory.
 constexpr uint32_t kMaxContinuationsPerPhase = 1000;
+
+/// The teleport waits this many times the ordinary per-phase settle.
+///
+/// It is the one phase whose in-flight work is a *cell transition*, which is
+/// measured in engine frames rather than in script frames and which everything
+/// after it reads. The follower regroup that follows used to report "moved to the
+/// player's cell but ended up in X" for exactly this reason - it moved people into
+/// a cell the player was still arriving in.
+constexpr uint32_t kTeleportSettleMultiplier = 2;
 
 }  // namespace
 
@@ -85,14 +96,13 @@ void RestoreOrchestrator::Begin(const std::filesystem::path& snapshotDir) {
         state->addedPlugins = diff.added;
         state->sink->SetPluginDiff(diff.missing, diff.added);
 
-        for (const auto& changed : diff.changed) {
-            state->sink->BeginCategory("_plugins", "Load order", 0);
-            state->sink->Warn(Report::ReasonCode::kFormTypeChanged,
-                              std::format("'{}' differs in size from the snapshot; local form IDs "
-                                          "inside it may have shifted",
-                                          changed));
-            state->sink->EndCategory();
-        }
+        // Nothing is said about plugins whose file size has changed. A different
+        // size means the mod was updated, which is the normal state of a modlist
+        // and says nothing about whether any particular record moved - it warned
+        // about 237 plugins on a run where the great majority resolved perfectly.
+        // A form that actually failed to resolve is reported by the category that
+        // wanted it, against an item the player recognises, which is both true and
+        // actionable. A blanket "may have shifted" is neither.
 
         // Back to the game thread for everything that touches the engine.
         Util::OnGameThread([this, state]() {
@@ -159,21 +169,42 @@ void RestoreOrchestrator::MaybeNotifyProgress(RunState& state, float fraction,
     spdlog::debug("RestoreOrchestrator: progress {}", text);
 }
 
+uint32_t RestoreOrchestrator::TakeSettleMs(RunState& state, Phase phase) {
+    const auto perPhase = static_cast<uint32_t>(Config::MigrationConfig::VmSettlePerPhaseMs());
+    const auto budget = static_cast<uint32_t>(Config::MigrationConfig::ImportSettleBudgetMs());
+    if (perPhase == 0 || budget == 0) {
+        return 0;
+    }
+
+    const bool isTeleport = phase == Phase::kTeleport;
+    const uint32_t want = isTeleport ? perPhase * kTeleportSettleMultiplier : perPhase;
+
+    // The teleport's share is reserved rather than queued for. How many phases
+    // reach the VM depends entirely on which mods are installed, so a plain
+    // first-come budget would let a modlist with many integrations spend the whole
+    // thing before the one phase that most needs the wait - and the settle after
+    // the teleport is what the follower regroup depends on.
+    const uint32_t reserved = isTeleport ? 0 : std::min(budget, perPhase * kTeleportSettleMultiplier);
+    const uint32_t ceiling = budget - reserved;
+    const uint32_t spendable = ceiling > state.settleSpentMs ? ceiling - state.settleSpentMs : 0;
+
+    const uint32_t settleMs = std::min(want, spendable);
+    state.settleSpentMs += settleMs;
+    return settleMs;
+}
+
 void RestoreOrchestrator::ApplyPhase(std::shared_ptr<RunState> state) {
     if (AbandonIfWorldChanged(state, "the apply pass")) {
         return;
     }
     if (state->phaseIndex >= state->phases.size()) {
-        // Phases done. Validation is a separate pass rather than a per-phase
-        // check because a value can be written correctly in phase 20 and
-        // clobbered in phase 80; checking at the moment of the write would
-        // confirm exactly the mistakes that matter least.
-        if (Config::MigrationConfig::ValidateAfterImport()) {
-            state->validateIndex = 0;
-            Util::OnGameThread([this, state]() { ValidateStep(state); });
-        } else {
-            Finish(state);
-        }
+        // Phases done. The settle pass comes next, and it comes *before* validation
+        // on purpose: it applies deferred work, and a validator reading a value back
+        // before the settle wrote it would report a mismatch that is not real.
+        state->queuedBeforeSettle = Defer::PendingWorkQueue::Get().Size();
+        state->settleLastRemaining = state->queuedBeforeSettle;
+        state->settleRound = 0;
+        Util::OnGameThread([this, state]() { SettleStep(state); });
         return;
     }
 
@@ -188,6 +219,12 @@ void RestoreOrchestrator::ApplyPhase(std::shared_ptr<RunState> state) {
     auto& registry = CategoryRegistry::Get();
     auto& pending = Defer::PendingWorkQueue::Get();
     auto* player = RE::PlayerCharacter::GetSingleton();
+
+    // Measured rather than declared. Whether a phase talks to Papyrus depends on
+    // which mods are installed and on what this particular snapshot contains, so
+    // a per-category flag would be wrong on half the modlists that run this. The
+    // counter cannot be wrong about it.
+    state->vmDispatchAtFrameStart = Papyrus::PapyrusInterface::DispatchCount();
 
     bool continuation = false;
     ApplyContext ctx{state->doc,        *state->sink, pending, state->missingPlugins,
@@ -235,22 +272,58 @@ void RestoreOrchestrator::ApplyPhase(std::shared_ptr<RunState> state) {
                 }
             }
         } else {
+            // One try per actor, not one per category. A throw is nearly always
+            // about the *subject* - a payload shape this actor does not have, a
+            // form that resolved to something else - and a single category-wide
+            // try meant the first such actor took every actor after it down with
+            // them, then reported the category as 0/0/0/0 as though it had never
+            // been attempted. `npc.obody_preset` did exactly that: every roster
+            // actor OBody had never rendered has no payload entry, so the first
+            // one threw and the rest were never visited.
+            const auto runOne = [&](const Model::ActorSubject& subject) {
+                try {
+                    entry.actor->ApplyActor(subject, ctx);
+                } catch (const std::exception& e) {
+                    const char* name = subject.actor ? subject.actor->GetName() : nullptr;
+                    state->sink->Failed(
+                        Report::SubjectRef{Report::SubjectKind::kActor, subject.refKey,
+                                           (name && *name) ? name : subject.refKey},
+                        std::format("{}/{}", subject.refKey, descriptor.id),
+                        Report::ReasonCode::kIoError,
+                        std::format("applier threw for this actor: {}", e.what()));
+                }
+            };
+
             try {
                 entry.actor->BeginApply(ctx);
-                entry.actor->ApplyActor(playerSubject, ctx);
-                for (const auto& subject : state->subjects) {
-                    entry.actor->ApplyActor(subject, ctx);
-                }
+            } catch (const std::exception& e) {
+                state->sink->FailCategory(Report::ReasonCode::kIoError,
+                                          std::format("BeginApply threw: {}", e.what()));
+            }
+            runOne(playerSubject);
+            for (const auto& subject : state->subjects) {
+                runOne(subject);
+            }
+            try {
+                // Separately, because several categories do their real work here -
+                // FollowerRegroup moves one follower per frame from EndApply - and
+                // an actor that threw above must not cost them that.
                 entry.actor->EndApply(ctx);
             } catch (const std::exception& e) {
                 state->sink->FailCategory(Report::ReasonCode::kIoError,
-                                          std::format("applier threw: {}", e.what()));
+                                          std::format("EndApply threw: {}", e.what()));
             }
         }
         spdlog::debug("RestoreOrchestrator: phase {} <- '{}' done", PhaseValue(phase),
                       descriptor.id);
         state->sink->EndCategory();
     }
+
+    // Carried across continuation frames, so a phase that spans twenty frames
+    // still earns exactly one settle - at the end, once it has stopped dispatching.
+    state->phaseTouchedVm =
+        state->phaseTouchedVm ||
+        Papyrus::PapyrusInterface::DispatchCount() != state->vmDispatchAtFrameStart;
 
     if (continuation && state->continuationCount < kMaxContinuationsPerPhase) {
         ++state->continuationCount;
@@ -271,8 +344,198 @@ void RestoreOrchestrator::ApplyPhase(std::shared_ptr<RunState> state) {
 
     state->continuationCount = 0;
     ++state->phaseIndex;
-    // One AddTask per phase, scheduling the next.
-    Util::OnGameThread([this, state]() { ApplyPhase(state); });
+
+    // ── The settle ────────────────────────────────────────────────────────
+    // Every call this plugin makes into another mod is asynchronous: the VM takes
+    // the call and runs it on its own schedule, and `PapyrusInterface` has no
+    // blocking wait at all - `WaitForResult` on the game thread deadlocks the VM
+    // the game thread is supposed to be pumping. So a phase returning means its
+    // calls were *accepted*, never that they ran, and chaining the next phase into
+    // the next frame meant writing on top of work that had not happened yet.
+    //
+    // The wait belongs to the phase that has just finished, which is why it is
+    // taken here at the boundary: it covers the hop into the validation pass -
+    // where reading a value back before the VM wrote it would report a mismatch
+    // that is not real - exactly as it covers the hop into the next phase.
+    //
+    // A phase that touched nothing waits for nothing. That is not a
+    // micro-optimisation: about half the phases here only write engine state, and
+    // padding those would spend the budget on steps with nothing in flight.
+    //
+    // The teleport is the one exception, and it is not really an exception: what
+    // it leaves in flight is a *cell transition*, which is an engine event and
+    // would not show up in the dispatch count at all. It does happen to make a
+    // Papyrus call - `MoveToNearestNavmeshLocation` - but that call is optional and
+    // best-effort, so hanging the wait on it would mean that on any install where
+    // the VM declined it, the follower regroup went straight back to moving people
+    // into a cell the player was still arriving in.
+    const bool touchedVm = state->phaseTouchedVm;
+    const auto settleMs =
+        (touchedVm || phase == Phase::kTeleport) ? TakeSettleMs(*state, phase) : 0;
+    state->phaseTouchedVm = false;
+
+    if (settleMs == 0) {
+        // One AddTask per phase, scheduling the next.
+        Util::OnGameThread([this, state]() { ApplyPhase(state); });
+        return;
+    }
+
+    spdlog::debug("RestoreOrchestrator: settling {} ms after phase {} ({}; {} of {} ms spent)",
+                  settleMs, PhaseValue(phase),
+                  touchedVm ? "reached the VM" : "cell transition in flight",
+                  state->settleSpentMs, Config::MigrationConfig::ImportSettleBudgetMs());
+    // A detached timer, never a sleep - see `OnGameThreadAfter`. The player keeps
+    // control for the whole wait, so the next frame re-checks the session epoch
+    // before touching a single one of the actor pointers resolved before it.
+    Util::OnGameThreadAfter(settleMs, [this, state]() { ApplyPhase(state); });
+}
+
+void RestoreOrchestrator::SettleStep(std::shared_ptr<RunState> state) {
+    if (AbandonIfWorldChanged(state, "the settle pass")) {
+        return;
+    }
+
+    const auto rounds = static_cast<uint32_t>(Config::MigrationConfig::DeferSettleRounds());
+    auto& queue = Defer::PendingWorkQueue::Get();
+
+    if (queue.Empty()) {
+        FinishSettle(state);
+        return;
+    }
+    if (rounds == 0) {
+        // Explicitly switched off. Nothing was attempted, so nothing is claimed:
+        // `FinishSettle` reports the queue as it stands and the event path takes it.
+        //
+        // Worth knowing: the `kImmediate` items are released only by the final round
+        // and by a game load, so with the pass off they wait for the reload the
+        // import asks for anyway. That is a delay, not a loss.
+        state->sink->BeginCategory("_settle", "Deferred work settled during the import",
+                                   PhaseValue(Phase::kSettle));
+        state->sink->Info(std::format(
+            "The settle pass is switched off (iDeferSettleRounds=0), so all {} outstanding item(s) "
+            "are left to apply as you meet each NPC.",
+            queue.Size()));
+        state->sink->EndCategory();
+        FinishSettle(state);
+        return;
+    }
+
+    // The last round is the one that releases the `kImmediate` items - work with no
+    // world precondition that was queued only to be ordered *after* the equipment
+    // churn. Releasing it earlier would put it back in front of the very churn it
+    // was moved behind, which for `npc.fertility` means the baby item gets stripped
+    // by an outfit apply that has not run yet.
+    const bool lastRound = state->settleRound + 1 >= rounds;
+    const auto outcome = Defer::DeferredRestoreManager::Get().DrainNow(
+        *state->sink, /*releaseImmediate=*/lastRound);
+    state->settleApplied += outcome.retired;
+    ++state->settleRound;
+
+    // Rounds are the honest denominator here, the way phases are in the apply pass.
+    // The throttle usually means the player sees one of these at most.
+    MaybeNotifyProgress(*state,
+                        static_cast<float>(state->settleRound) / static_cast<float>(rounds),
+                        "settling");
+
+    spdlog::debug("RestoreOrchestrator: settle round {} of {} retired {} item(s), {} remaining{}",
+                  state->settleRound, rounds, outcome.retired, outcome.remaining,
+                  lastRound ? " (immediate items released)" : "");
+
+    if (outcome.remaining == 0) {
+        FinishSettle(state);
+        return;
+    }
+    if (state->settleRound >= rounds) {
+        FinishSettle(state);
+        return;
+    }
+
+    // Stopped shrinking. A drain that stopped on `kMaxAppliesPerDrain` does not
+    // count - it left items untried, and untried is not the same as unreachable.
+    if (outcome.remaining >= state->settleLastRemaining && !outcome.budgetHit) {
+        ++state->settleStallRounds;
+    } else {
+        state->settleStallRounds = 0;
+    }
+    state->settleLastRemaining = outcome.remaining;
+
+    // Two stalled rounds in a row: every subject still queued is somewhere the
+    // engine has not loaded, so the pass skips to its final round rather than
+    // spending the rest of the budget proving it. The final round still has to
+    // happen - it is the only one that releases the immediate items, and those are
+    // not waiting on anything the queue size can tell us about.
+    if (state->settleStallRounds >= 2 && state->settleRound + 1 < rounds) {
+        spdlog::debug("RestoreOrchestrator: settle made no progress for {} rounds at {} item(s); "
+                      "jumping to the final round",
+                      state->settleStallRounds, outcome.remaining);
+        state->settleRound = rounds - 1;
+    }
+
+    const auto roundMs = static_cast<uint32_t>(Config::MigrationConfig::DeferSettleRoundMs());
+    if (roundMs == 0) {
+        Util::OnGameThread([this, state]() { SettleStep(state); });
+    } else {
+        // A detached timer, never a sleep: what the pass is waiting for - a moved
+        // actor's 3D attaching - is done *by* the game thread.
+        Util::OnGameThreadAfter(roundMs, [this, state]() { SettleStep(state); });
+    }
+}
+
+void RestoreOrchestrator::FinishSettle(std::shared_ptr<RunState> state) {
+    if (AbandonIfWorldChanged(state, "the end of the settle pass")) {
+        return;
+    }
+
+    // One row of its own, so the settle is visible as a step of the import rather
+    // than as unexplained successes attributed to categories that had already
+    // reported themselves finished.
+    state->sink->BeginCategory("_settle", "Deferred work settled during the import",
+                               PhaseValue(Phase::kSettle));
+    if (state->queuedBeforeSettle == 0) {
+        // Said out loud because it is the good case and it is otherwise invisible:
+        // every NPC was reachable and nothing is outstanding.
+        state->sink->Info("Nothing had to be deferred: every recorded NPC was reachable during the "
+                          "import.");
+    } else {
+        state->sink->Info(std::format(
+            "{} item(s) could not be applied on the first attempt. The settle pass took {} of them "
+            "in {} round(s), after the followers had been brought to you.",
+            state->queuedBeforeSettle, state->settleApplied, state->settleRound));
+    }
+    // Closed before `ReportRemaining`, which opens a category per item: leaving this
+    // one open across that would nest, and `EndCategory` is what derives a row's
+    // status and folds its held-back items.
+    state->sink->EndCategory();
+
+    // Only now, once the pass has had its chance, is a surviving item genuinely
+    // "waiting until you see them" - which is why no category claims that at
+    // enqueue time. `ClaimBucket` allows one bucket per item id for the whole run,
+    // so an early claim could never have been corrected.
+    const auto remaining = Defer::DeferredRestoreManager::Get().ReportRemaining(*state->sink);
+    state->sink->BeginCategory("_settle", "Deferred work settled during the import",
+                               PhaseValue(Phase::kSettle));
+    if (remaining > 0) {
+        state->sink->Info(std::format(
+            "{} item(s) are still queued, for NPCs the engine has not loaded. They are recorded in "
+            "the save and apply themselves the next time you are near each one; a separate "
+            "'deferred' report is written once the last of them lands.",
+            remaining));
+    }
+    state->sink->EndCategory();
+
+    spdlog::info("RestoreOrchestrator: settle pass applied {} of {} deferred item(s) in {} round(s),"
+                 " {} remaining",
+                 state->settleApplied, state->queuedBeforeSettle, state->settleRound, remaining);
+
+    // Validation is a separate pass rather than a per-phase check because a value
+    // can be written correctly in phase 20 and clobbered in phase 80; checking at
+    // the moment of the write would confirm exactly the mistakes that matter least.
+    if (Config::MigrationConfig::ValidateAfterImport()) {
+        state->validateIndex = 0;
+        Util::OnGameThread([this, state]() { ValidateStep(state); });
+    } else {
+        Finish(state);
+    }
 }
 
 void RestoreOrchestrator::ValidateStep(std::shared_ptr<RunState> state) {
@@ -314,24 +577,29 @@ void RestoreOrchestrator::ValidateStep(std::shared_ptr<RunState> state) {
         ctx.validationIssues = &state->validationIssues;
 
         // A separate rollup id from the apply pass: `ReportSink::BeginCategory`
-        // appends, and its forced-status set is keyed by id, so re-opening the
-        // same id would let an apply-time skip suppress the validation status.
+        // resumes a row when the id repeats, and its forced-status set is keyed
+        // by id, so re-opening the same id would both merge the check into the
+        // apply row and let an apply-time skip suppress the validation status.
         state->sink->BeginCategory(std::string(descriptor.id) + "#validate",
                                    std::string(descriptor.displayName) + " (check)",
                                    PhaseValue(descriptor.phase));
-        try {
-            if (entry.global) {
-                entry.global->Validate(ctx);
-            } else {
-                entry.actor->ValidateActor(Util::ActorEnum::PlayerSubject(), ctx);
-                for (const auto& subject : state->subjects) {
-                    entry.actor->ValidateActor(subject, ctx);
-                }
+        // A throwing validator must never be able to condemn a good import - and,
+        // per actor, must not stop the actors after it from being checked either.
+        const auto guard = [&](auto&& call) {
+            try {
+                call();
+            } catch (const std::exception& e) {
+                state->sink->Warn(Report::ReasonCode::kIoError,
+                                  std::format("validator threw: {}", e.what()));
             }
-        } catch (const std::exception& e) {
-            // A throwing validator must never be able to condemn a good import.
-            state->sink->Warn(Report::ReasonCode::kIoError,
-                              std::format("validator threw: {}", e.what()));
+        };
+        if (entry.global) {
+            guard([&] { entry.global->Validate(ctx); });
+        } else {
+            guard([&] { entry.actor->ValidateActor(Util::ActorEnum::PlayerSubject(), ctx); });
+            for (const auto& subject : state->subjects) {
+                guard([&] { entry.actor->ValidateActor(subject, ctx); });
+            }
         }
         state->sink->EndCategory();
     }
@@ -342,6 +610,11 @@ void RestoreOrchestrator::ValidateStep(std::shared_ptr<RunState> state) {
 
 void RestoreOrchestrator::Finish(std::shared_ptr<RunState> state) {
     auto& pending = Defer::PendingWorkQueue::Get();
+    // Read after the settle pass, which is the whole point of the settle pass being
+    // a step of the run. This number used to be taken while the followers' 3D was
+    // still attaching, so the player was told a dozen items were outstanding for
+    // work that completed a second later - and `ClassifyImport` was given the same
+    // inflated figure.
     const auto deferredCount = pending.Size();
 
     MigrationState::Get().MarkRestored(state->snapshotDir.filename().string(),

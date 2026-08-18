@@ -542,10 +542,14 @@ void TngIniCategory::Apply(Core::ApplyContext& ctx) {
             plan.missingPlugins.size(), Util::JoinStrings(plan.missingPlugins, ", ")));
     }
 
+    // `SaveMainIni` loads the file before it stores anything and `SaveIniPairs`
+    // only writes the keys TNG holds in memory, so these lines survive TNG's own
+    // saves. The exception is an actor TNG has already loaded this session: its
+    // in-memory value wins, which is why the entries land properly on the next
+    // launch, when TNG reads them at startup.
     ctx.report.Info(std::format(
         "Written to {}. TNG reads this file when the game starts, so the NPC entries take effect on "
-        "your next launch rather than now - and TNG rewrites the file from its own memory when its "
-        "settings change, so if that happens before you quit, run this import once more. The "
+        "your next launch rather than now. The "
         "previous contents were copied to {} first.",
         merged.targetFile,
         merged.backupFile.empty() ? "nowhere: the backup could not be written" : merged.backupFile));

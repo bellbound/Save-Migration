@@ -33,8 +33,11 @@ const Core::CategoryDescriptor& PlayerSkills::Describe() const {
     static const Core::CategoryDescriptor descriptor{
         .id = kId,
         .displayName = "Skills and skill XP",
-        // Before level and before perks: `PerkData::level` gates a perk against
-        // the *skill* level, so a perk applied before its skill would be rejected.
+        // Before level: writing a skill can trip the engine's level-up
+        // bookkeeping, which would move the level out from under the write that
+        // follows. It also has to land before the player is handed their perk
+        // points, since `PerkData::level` gates a perk against the *skill* level
+        // and a tree they cannot afford to read is not a tree they can spend in.
         .phase = Core::Phase::kIdentity,
         .restoreMode = Core::RestoreMode::kInstant,
         .requirement = {},

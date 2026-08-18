@@ -44,9 +44,9 @@ public:
         /// Here now, absent from the snapshot. Harmless, but worth reporting -
         /// a newly added mod may fight a restore.
         std::vector<std::string> added;
-        /// Present in both but with a different size, i.e. a different version.
-        /// Local form IDs may have shifted inside it.
-        std::vector<std::string> changed;
+        // No `changed` set. It listed plugins whose file size differs, which is
+        // true of most of a modlist that has seen any updates and predicts
+        // nothing about whether a recorded form still resolves.
     };
 
     /// Compare a snapshot's recorded order against the live one.

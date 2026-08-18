@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <format>
 
 namespace SaveMigration::Report {
 
@@ -60,6 +61,28 @@ void ReportSink::SetPluginDiff(std::vector<std::string> missing, std::vector<std
 
 void ReportSink::BeginCategory(std::string_view id, std::string_view displayName, int phase) {
     std::lock_guard lock(m_mutex);
+
+    // Re-opening an id resumes its existing row rather than starting a second
+    // one. A category is opened once per *frame the phase runs on*, not once per
+    // import: `RestoreOrchestrator` re-walks `EntriesForPhase` on every
+    // continuation frame, so a phase that spans twenty frames used to print
+    // twenty rows per category - the same two home categories alternating down
+    // the CATEGORIES table, most of them 0/0/0/0 because the work had already
+    // happened on the first frame.
+    //
+    // Resuming is also what makes the totals right: the counters accumulate
+    // across the frames instead of the last frame's row being the one the reader
+    // sees. Anything that genuinely wants its own row asks for its own id - the
+    // validation pass appends `#validate` for exactly that reason.
+    for (size_t i = 0; i < m_report.categories.size(); ++i) {
+        if (m_report.categories[i].id == id) {
+            m_current = i;
+            m_iniSkippedItems = 0;
+            m_iniSkipExample.clear();
+            return;
+        }
+    }
+
     CategoryRollup rollup;
     rollup.id = id;
     rollup.displayName = displayName;
@@ -67,6 +90,8 @@ void ReportSink::BeginCategory(std::string_view id, std::string_view displayName
     rollup.status = CategoryStatus::kOk;
     m_report.categories.push_back(std::move(rollup));
     m_current = m_report.categories.size() - 1;
+    m_iniSkippedItems = 0;
+    m_iniSkipExample.clear();
 }
 
 CategoryRollup& ReportSink::CurrentCategory() {
@@ -89,6 +114,13 @@ void ReportSink::SkipCategory(ReasonCode reason, std::string_view message) {
     category.status = CategoryStatus::kSkipped;
     category.note = message;
     m_forcedStatus.insert(category.id);
+    if (reason == ReasonCode::kSkippedByIni) {
+        // One collected list instead of an entry each. The category row already
+        // carries the status and the note, so the entry was a third copy of a
+        // fact the reader has to scroll past to reach a real failure.
+        m_report.iniDisabledCategories.push_back(std::format("{} - {}", category.id, message));
+        return;
+    }
     Push(Severity::kInfo, SystemSubject(category.displayName), reason, message, {}, {}, 0, true);
 }
 
@@ -107,6 +139,12 @@ void ReportSink::EndCategory() {
         return;
     }
     auto& category = m_report.categories[m_current];
+    if (m_iniSkippedItems > 0 && category.note.empty()) {
+        category.note = std::format("{} item(s) held back by an INI switch, e.g. {}",
+                                    m_iniSkippedItems, m_iniSkipExample);
+        m_iniSkippedItems = 0;
+        m_iniSkipExample.clear();
+    }
     if (!m_forcedStatus.contains(category.id)) {
         // Derived status. Note that deferred work counts as *partial*, not ok:
         // the category is genuinely not finished yet, and the deferred
@@ -232,6 +270,18 @@ void ReportSink::SkippedItem(const SubjectRef& subject, std::string_view itemId,
         return;
     }
     ++CurrentCategory().skipped;
+    if (reason == ReasonCode::kSkippedByIni) {
+        // No entry per item. A switch that is off says the same sentence about
+        // every item it covers - fourteen item lines each telling the reader to
+        // set the same switch is one sentence and thirteen copies of it.
+        // `EndCategory` folds them into a single note on the category row, so the
+        // switch is still named exactly once.
+        ++m_iniSkippedItems;
+        if (m_iniSkipExample.empty()) {
+            m_iniSkipExample = message;
+        }
+        return;
+    }
     Push(Severity::kInfo, subject, reason, message, {}, targetDisplayName, 1, true);
 }
 
@@ -289,6 +339,8 @@ MigrationReport ReportSink::Finish() {
     m_itemBuckets.clear();
     m_subjectIndex.clear();
     m_forcedStatus.clear();
+    m_iniSkippedItems = 0;
+    m_iniSkipExample.clear();
     m_current = static_cast<size_t>(-1);
     return out;
 }

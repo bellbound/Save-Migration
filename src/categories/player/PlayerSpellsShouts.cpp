@@ -56,8 +56,7 @@ const Core::CategoryDescriptor& PlayerSpellsShouts::Describe() const {
     static const Core::CategoryDescriptor descriptor{
         .id = kId,
         .displayName = "Spells, shouts, standing stone",
-        // After perks (some abilities are perk-conditioned) and before equipment
-        // (which cannot equip a spell the player does not know).
+        // Before equipment, which cannot equip a spell the player does not know.
         .phase = Core::Phase::kAbilities,
         .restoreMode = Core::RestoreMode::kInstant,
         .requirement = {},

@@ -76,13 +76,18 @@ void MigrationConfig::Initialize() {
     storage->RegisterIntOption(Keys::kGameTimeMode, 0);
     storage->RegisterIntOption(Keys::kKillToMatch, 0);
     storage->RegisterIntOption(Keys::kAllowLoverRank, 0);
-    storage->RegisterIntOption(Keys::kRestoreQuestPerks, 0);
+    storage->RegisterIntOption(Keys::kRestoreLycanthropy, 1);
+    storage->RegisterIntOption(Keys::kRestoreVampireLord, 0);
     storage->RegisterIntOption(Keys::kRestoreVrEditorConfig, 0);
     storage->RegisterStringOption(Keys::kDisabledCategories, "");
     storage->RegisterStringOption(Keys::kPluginAliases, "");
 
     storage->RegisterIntOption(Keys::kItemsPerFrame, 200);
     storage->RegisterIntOption(Keys::kDeferMaxAttempts, 8);
+    storage->RegisterIntOption(Keys::kVmSettlePerPhaseMs, 1200);
+    storage->RegisterIntOption(Keys::kImportSettleBudgetMs, 10000);
+    storage->RegisterIntOption(Keys::kDeferSettleRounds, 6);
+    storage->RegisterIntOption(Keys::kDeferSettleRoundMs, 400);
 
     storage->RegisterIntOption(Keys::kFertilityDryRun, 0);
     storage->RegisterIntOption(Keys::kVerifySkillMirror, 1);
@@ -169,7 +174,10 @@ bool MigrationConfig::KillToMatch() { return GetBool(Keys::kKillToMatch, false);
 
 bool MigrationConfig::AllowLoverRank() { return GetBool(Keys::kAllowLoverRank, false); }
 
-bool MigrationConfig::RestoreQuestPerks() { return GetBool(Keys::kRestoreQuestPerks, false); }
+bool MigrationConfig::RestoreLycanthropy() { return GetBool(Keys::kRestoreLycanthropy, true); }
+
+bool MigrationConfig::RestoreVampireLord() { return GetBool(Keys::kRestoreVampireLord, false); }
+
 
 bool MigrationConfig::RestoreVrEditorConfig() {
     return GetBool(Keys::kRestoreVrEditorConfig, false);
@@ -189,6 +197,29 @@ int MigrationConfig::ItemsPerFrame() {
 
 int MigrationConfig::DeferMaxAttempts() {
     return std::clamp(Storage()->GetInt(Keys::kDeferMaxAttempts, 8), 1, 100);
+}
+
+int MigrationConfig::VmSettlePerPhaseMs() {
+    // 0 is a legitimate setting - it restores the old behaviour of chaining every
+    // phase into the next frame - so there is no floor. The ceiling is per phase,
+    // not per import; `ImportSettleBudgetMs` is what bounds the run.
+    return std::clamp(Storage()->GetInt(Keys::kVmSettlePerPhaseMs, 1200), 0, 30000);
+}
+
+int MigrationConfig::ImportSettleBudgetMs() {
+    return std::clamp(Storage()->GetInt(Keys::kImportSettleBudgetMs, 10000), 0, 120000);
+}
+
+int MigrationConfig::DeferSettleRounds() {
+    // 0 is legitimate and means "do not wait for anyone" - the event-driven path
+    // then handles the whole queue, which is what this plugin did before the pass
+    // existed. The ceiling is low on purpose: past a handful of rounds the queue has
+    // stopped shrinking and the pass exits on its own anyway.
+    return std::clamp(Storage()->GetInt(Keys::kDeferSettleRounds, 6), 0, 40);
+}
+
+int MigrationConfig::DeferSettleRoundMs() {
+    return std::clamp(Storage()->GetInt(Keys::kDeferSettleRoundMs, 400), 0, 5000);
 }
 
 bool MigrationConfig::FertilityDryRun() { return GetBool(Keys::kFertilityDryRun, false); }

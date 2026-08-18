@@ -214,6 +214,14 @@ std::string JoinStrings(const std::vector<std::string>& parts, std::string_view 
     return out;
 }
 
+std::string JoinCapped(const std::vector<std::string>& parts, size_t maxNamed) {
+    if (parts.size() <= maxNamed) {
+        return JoinStrings(parts, ", ");
+    }
+    const std::vector<std::string> head(parts.begin(), parts.begin() + maxNamed);
+    return std::format("{}, and {} more", JoinStrings(head, ", "), parts.size() - maxNamed);
+}
+
 bool IEquals(std::string_view a, std::string_view b) {
     if (a.size() != b.size()) {
         return false;

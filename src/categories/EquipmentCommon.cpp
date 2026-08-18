@@ -77,6 +77,24 @@ nlohmann::json EquipmentCommon::Collect(RE::Actor* actor) {
     return worn;
 }
 
+bool EquipmentCommon::IsWorn(RE::Actor* actor, RE::TESBoundObject* object) {
+    if (!actor || !object) {
+        return false;
+    }
+    // Filtered to the one object rather than walking the whole inventory: an NPC
+    // carrying a few hundred items is normal and this is called twice per recorded
+    // entry.
+    const auto inventory = actor->GetInventory(
+        [object](RE::TESBoundObject& candidate) { return &candidate == object; });
+    for (const auto& [item, data] : inventory) {
+        const auto& [count, entry] = data;
+        if (count > 0 && entry && entry->IsWorn()) {
+            return true;
+        }
+    }
+    return false;
+}
+
 EquipmentCommon::ApplyResult EquipmentCommon::Apply(RE::Actor* actor, const nlohmann::json& worn,
                                                    const Report::SubjectRef& subject,
                                                    Core::ApplyContext& ctx) {
@@ -123,10 +141,31 @@ EquipmentCommon::ApplyResult EquipmentCommon::Apply(RE::Actor* actor, const nloh
             continue;
         }
 
+        // Already on. Claims no bucket and says nothing, which is what makes a
+        // deferred replay of this same outfit idempotent: the first attempt's
+        // successes are not re-reported by the second.
+        if (IsWorn(actor, object)) {
+            ++result.alreadyWorn;
+            continue;
+        }
+
         equipManager->EquipObject(actor, object, nullptr, 1, nullptr, /*queueEquip=*/true,
                                   /*forceEquip=*/false, /*playSounds=*/false, /*applyNow=*/false);
-        ++result.equipped;
-        ctx.report.Succeeded(subject, itemId, key, displayName);
+
+        // Read it back in the same frame. `EquipObject` queues the animation and
+        // the biped rebuild, but the worn flag on the inventory entry is set inside
+        // the call - so a same-frame read is meaningful, and a negative is the
+        // honest signal that this actor was not equippable right now.
+        if (IsWorn(actor, object)) {
+            ++result.verified;
+            ctx.report.Succeeded(subject, itemId, key, displayName);
+        } else {
+            // Deliberately no report line: `ClaimBucket` allows one bucket per
+            // item id for the whole run, and the caller may be about to queue this
+            // and land it a second later. Whoever gives up on it reports it.
+            ++result.unconfirmed;
+            result.unconfirmedKeys.push_back(key);
+        }
     }
 
     return result;

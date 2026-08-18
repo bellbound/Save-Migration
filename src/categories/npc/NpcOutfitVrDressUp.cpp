@@ -215,11 +215,10 @@ void NpcOutfitVrDressUp::ApplyActor(const Model::ActorSubject& subject, Core::Ap
     item.maxAttempts = 8;
     item.payload = Util::SafeDump(payload);
     if (ctx.pending.Enqueue(std::move(item))) {
-        ctx.report.Deferred(subjectRef, std::format("{}/vr_dressup_equip", subject.refKey),
-                            std::format("'{}' outfit stored now; the equip and the lock re-arm wait "
-                                        "until they load, so ApplyOutfit cannot prune against an "
-                                        "unfilled inventory",
-                                        subject.displayName));
+        // Said by `DeferredRestoreManager::ReportRemaining` once the settle pass has
+        // had its go, not here - see the note on the same decision in NpcEquipment.
+        spdlog::debug("NpcOutfitVrDressUp: equip and lock re-arm for '{}' queued behind their 3D",
+                      subject.displayName);
     }
 }
 

@@ -304,11 +304,13 @@ void NpcHomeMhiyh::EndApply(Core::ApplyContext& ctx) {
             item.maxAttempts = 8;
             item.payload = Util::SafeDump(payload);
             if (ctx.pending.Enqueue(std::move(item))) {
-                ctx.report.Deferred(subjectRef, itemId,
-                                    std::format("'{}' is unloaded and the free MHIYH alias is "
-                                                "kLoadedOnly, so the fill would silently fail. "
-                                                "Queued until they load.",
-                                                displayName));
+                // Reported by `DeferredRestoreManager::ReportRemaining` at the end of
+                // the settle pass, not here: the settle usually fills this alias
+                // before the run ends, and a `Deferred` claim written now would be
+                // stuck - one bucket per item id for the whole run.
+                spdlog::debug("NpcHomeMhiyh: '{}' is unloaded and the free alias is kLoadedOnly; "
+                              "queued",
+                              displayName);
                 if (!m_pending.empty()) {
                     ctx.RequestContinuation();
                 }

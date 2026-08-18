@@ -27,9 +27,11 @@ std::string_view ToString(Phase phase) {
         case Phase::kInventory:    return "inventory";
         case Phase::kEquipment:    return "equipment";
         case Phase::kWorldState:   return "world_state";
-        case Phase::kTeleport:     return "teleport";
         case Phase::kFollowers:    return "followers";
         case Phase::kIntegrations: return "integrations";
+        case Phase::kTeleport:     return "teleport";
+        case Phase::kRegroup:      return "regroup";
+        case Phase::kSettle:       return "settle";
         case Phase::kSideCar:      return "sidecar";
     }
     return "unknown";

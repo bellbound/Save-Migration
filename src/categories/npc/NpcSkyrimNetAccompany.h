@@ -13,6 +13,16 @@ namespace SaveMigration::Categories {
 /// and the linked ref — and reconstructed on restore by asking SkyrimNet to register
 /// the package again.
 ///
+/// It is also **how following itself is restored**. An actor with the
+/// `current_follower` role gets the `FollowPlayer` package even when the snapshot
+/// recorded no SkyrimNet state for them, which is the normal case for a follower
+/// recruited through vanilla dialogue. The vanilla teammate flag is deliberately
+/// not set: it drags the DialogueFollower quest behind it, and a follower resuming
+/// through that mid-restore - before equipment has settled, in a cell that has just
+/// attached - is what made restoring following look like a bad idea in the first
+/// place. A recorded "wait here" wins over the role, because it is an instruction
+/// the player gave on purpose.
+///
 /// Deferred to actor load, and **last** in the deferred chain: registering a package
 /// changes AI behaviour and can walk the actor out of the loaded set, which would
 /// abort anything still queued behind it.

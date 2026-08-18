@@ -1,6 +1,7 @@
 #include "papyrus/PapyrusInterface.h"
 
 #include <algorithm>
+#include <atomic>
 #include <format>
 #include <memory>
 
@@ -20,6 +21,24 @@ namespace SaveMigration::Papyrus {
 // because the game thread is what pumps that VM.
 
 namespace {
+
+/// Every dispatch the VM accepted, since the process started.
+///
+/// Relaxed ordering throughout: the only reader compares two samples of this one
+/// value for inequality, and never needs it ordered against anything else.
+std::atomic<std::uint64_t> g_dispatchCount{0};
+
+/// Counts `ok` and passes it straight through, so a dispatch site stays one line.
+///
+/// Wraps the *result*, not the attempt: a call rejected because the script does
+/// not declare the function never reached the VM, so there is nothing for anyone
+/// downstream to wait for.
+bool Dispatched(bool ok) {
+    if (ok) {
+        g_dispatchCount.fetch_add(1, std::memory_order_relaxed);
+    }
+    return ok;
+}
 
 template <class T, class Extract>
 class AsyncCaptor final : public RE::BSScript::IStackCallbackFunctor {
@@ -115,6 +134,10 @@ PapyrusInterface* PapyrusInterface::GetSingleton() {
 
 RE::BSScript::Internal::VirtualMachine* PapyrusInterface::GetVM() {
     return RE::BSScript::Internal::VirtualMachine::GetSingleton();
+}
+
+std::uint64_t PapyrusInterface::DispatchCount() {
+    return g_dispatchCount.load(std::memory_order_relaxed);
 }
 
 bool PapyrusInterface::HasFunction(const std::string& scriptName, const std::string& functionName,
@@ -372,7 +395,7 @@ bool PapyrusInterface::CallGlobalFunction(const std::string& scriptName,
     }
     DynamicFunctionArguments funcArgs(this, args);
     RE::BSTSmartPointer<RE::BSScript::IStackCallbackFunctor> noCallback;
-    const bool ok = vm->DispatchStaticCall(scriptName, functionName, &funcArgs, noCallback);
+    const bool ok = Dispatched(vm->DispatchStaticCall(scriptName, functionName, &funcArgs, noCallback));
     spdlog::debug("PapyrusInterface: {}::{}({} args) -> {}", scriptName, functionName, args.size(),
                   ok);
     return ok;
@@ -391,7 +414,7 @@ bool PapyrusInterface::CallGlobalFunctionInt(const std::string& scriptName,
     }
     DynamicFunctionArguments funcArgs(this, args);
     auto captor = MakeCaptor<int32_t>(std::move(callback), ExtractInt);
-    return vm->DispatchStaticCall(scriptName, functionName, &funcArgs, captor);
+    return Dispatched(vm->DispatchStaticCall(scriptName, functionName, &funcArgs, captor));
 }
 
 bool PapyrusInterface::CallGlobalFunctionString(const std::string& scriptName,
@@ -413,7 +436,7 @@ bool PapyrusInterface::CallGlobalFunctionString(const std::string& scriptName,
             }
         },
         ExtractString);
-    return vm->DispatchStaticCall(scriptName, functionName, &funcArgs, captor);
+    return Dispatched(vm->DispatchStaticCall(scriptName, functionName, &funcArgs, captor));
 }
 
 bool PapyrusInterface::CallGlobalFunctionBool(const std::string& scriptName,
@@ -429,7 +452,7 @@ bool PapyrusInterface::CallGlobalFunctionBool(const std::string& scriptName,
     }
     DynamicFunctionArguments funcArgs(this, args);
     auto captor = MakeCaptor<bool>(std::move(callback), ExtractBool);
-    return vm->DispatchStaticCall(scriptName, functionName, &funcArgs, captor);
+    return Dispatched(vm->DispatchStaticCall(scriptName, functionName, &funcArgs, captor));
 }
 
 bool PapyrusInterface::CallGlobalFunctionForm(const std::string& scriptName,
@@ -445,7 +468,7 @@ bool PapyrusInterface::CallGlobalFunctionForm(const std::string& scriptName,
     }
     DynamicFunctionArguments funcArgs(this, args);
     auto captor = MakeCaptor<RE::TESForm*>(std::move(callback), ExtractForm);
-    return vm->DispatchStaticCall(scriptName, functionName, &funcArgs, captor);
+    return Dispatched(vm->DispatchStaticCall(scriptName, functionName, &funcArgs, captor));
 }
 
 bool PapyrusInterface::CallGlobalFunctionStringArray(const std::string& scriptName,
@@ -467,7 +490,7 @@ bool PapyrusInterface::CallGlobalFunctionStringArray(const std::string& scriptNa
             }
         },
         ExtractStringArray);
-    return vm->DispatchStaticCall(scriptName, functionName, &funcArgs, captor);
+    return Dispatched(vm->DispatchStaticCall(scriptName, functionName, &funcArgs, captor));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -508,7 +531,7 @@ bool PapyrusInterface::CallMethod(RE::TESForm* target, const std::string& script
     DynamicFunctionArguments funcArgs(this, args);
     RE::BSTSmartPointer<RE::BSScript::IStackCallbackFunctor> noCallback;
     const bool ok =
-        vm->DispatchMethodCall2(handle, scriptName, functionName, &funcArgs, noCallback);
+        Dispatched(vm->DispatchMethodCall2(handle, scriptName, functionName, &funcArgs, noCallback));
     spdlog::debug("PapyrusInterface: {:08X}.{}::{}({} args) -> {}", target->GetFormID(), scriptName,
                   functionName, args.size(), ok);
     return ok;
@@ -527,7 +550,7 @@ bool PapyrusInterface::CallMethodInt(RE::TESForm* target, const std::string& scr
     }
     DynamicFunctionArguments funcArgs(this, args);
     auto captor = MakeCaptor<int32_t>(std::move(callback), ExtractInt);
-    return vm->DispatchMethodCall2(handle, scriptName, functionName, &funcArgs, captor);
+    return Dispatched(vm->DispatchMethodCall2(handle, scriptName, functionName, &funcArgs, captor));
 }
 
 bool PapyrusInterface::CallMethodBool(RE::TESForm* target, const std::string& scriptName,
@@ -543,7 +566,7 @@ bool PapyrusInterface::CallMethodBool(RE::TESForm* target, const std::string& sc
     }
     DynamicFunctionArguments funcArgs(this, args);
     auto captor = MakeCaptor<bool>(std::move(callback), ExtractBool);
-    return vm->DispatchMethodCall2(handle, scriptName, functionName, &funcArgs, captor);
+    return Dispatched(vm->DispatchMethodCall2(handle, scriptName, functionName, &funcArgs, captor));
 }
 
 bool PapyrusInterface::CallAliasMethod(RE::BGSBaseAlias* alias, const std::string& scriptName,
@@ -574,7 +597,7 @@ bool PapyrusInterface::CallAliasMethod(RE::BGSBaseAlias* alias, const std::strin
     DynamicFunctionArguments funcArgs(this, args);
     RE::BSTSmartPointer<RE::BSScript::IStackCallbackFunctor> noCallback;
     const bool ok =
-        vm->DispatchMethodCall2(handle, scriptName, functionName, &funcArgs, noCallback);
+        Dispatched(vm->DispatchMethodCall2(handle, scriptName, functionName, &funcArgs, noCallback));
     spdlog::debug("PapyrusInterface: alias '{}'.{}::{} -> {}", alias->aliasName.c_str(), scriptName,
                   functionName, ok);
     return ok;

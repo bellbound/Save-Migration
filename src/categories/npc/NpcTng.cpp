@@ -413,9 +413,6 @@ void NpcTng::ApplyActor(const Model::ActorSubject& subject, Core::ApplyContext& 
         return;
     }
 
-    const auto subjectRef = Report::PlayerSubject();
-    const auto itemId = std::format("{}/tng", subject.refKey);
-
     // TNG's own UpdatePlayerAfterLoad runs at kPostLoadGame and would overwrite an
     // immediate write, and the addon swap needs the player's 3D anyway. So this
     // always goes through the deferred queue with a 3D-loaded trigger.
@@ -427,9 +424,12 @@ void NpcTng::ApplyActor(const Model::ActorSubject& subject, Core::ApplyContext& 
         item.maxAttempts = 8;
         item.payload = Util::SafeDump(payload);
         if (ctx.pending.Enqueue(std::move(item))) {
-            ctx.report.Deferred(subjectRef, itemId,
-                                "TNG addon queued until the player has 3D and TNG's own post-load "
-                                "pass has finished, so we are the last writer");
+            // The player without 3D during an import is the odd case, not the normal
+            // one, and the settle pass will almost certainly clear it before the run
+            // ends. Reported - if it survives - by
+            // `DeferredRestoreManager::ReportRemaining`, which is the one voice for
+            // deferral now that a claim made here could not be corrected.
+            spdlog::debug("NpcTng: the player has no 3D yet; addon swap queued");
         }
         return;
     }
@@ -548,9 +548,6 @@ bool NpcTng::ApplyDeferred(const Model::ActorSubject& subject, Core::ApplyContex
     });
 
     ctx.report.Succeeded(subjectRef, itemId, wantedAddonKey, "TNG player addon");
-    ctx.report.Info(
-        "TNG's INI was deliberately not written directly: SaveMainIni rewrites the whole file from "
-        "memory on every save, so a direct write would be discarded.");
     return true;
 }
 

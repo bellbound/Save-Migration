@@ -7,10 +7,12 @@ namespace SaveMigration::Categories {
 /// Character level, character XP threshold and perk points.
 ///
 /// Split from `PlayerAttributes` below even though both live in this file,
-/// because the apply order requires perks and spells to land *between* them:
-/// level gates perk availability, and the health/magicka/stamina write has to
-/// come after anything that adds a permanent or temporary actor-value modifier
-/// or the recalculation clobbers it.
+/// because the apply order requires spells and equipment to land *between* them:
+/// the health/magicka/stamina write has to come after anything that adds a
+/// permanent or temporary actor-value modifier or the recalculation clobbers it.
+///
+/// **Perk points are granted from the level, not restored from the snapshot**,
+/// and individual perks are not migrated at all. The reasoning is in `Apply`.
 ///
 /// There is no `ActorValue::kLevel`. The level lives in `ACTOR_BASE_DATA::level`
 /// on the base record, and the XP bar position lives in the `PlayerSkills` block,
@@ -25,8 +27,9 @@ public:
     [[nodiscard]] const Core::CategoryDescriptor& Describe() const override;
     void Collect(Core::CollectContext& ctx) override;
     void Apply(Core::ApplyContext& ctx) override;
-    /// Level and perk points, read back. Both are single integers with no
-    /// legitimate reason to move during an import, so any difference is hard.
+    /// Level and perk points, read back. The level has no legitimate reason to
+    /// move during an import, so a difference there is hard; the point count is
+    /// soft, because the player can spend one before the read-back.
     void Validate(Core::ApplyContext& ctx) override;
 };
 

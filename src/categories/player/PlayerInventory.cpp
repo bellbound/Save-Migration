@@ -14,8 +14,8 @@ const Core::CategoryDescriptor& PlayerInventory::Describe() const {
     static const Core::CategoryDescriptor descriptor{
         .id = kId,
         .displayName = "Player inventory",
-        // After perks and skills: armour rating, damage and value are computed on
-        // add, so the modifiers have to exist first.
+        // After skills: armour rating, damage and value are computed on add, so
+        // the modifiers have to exist first.
         .phase = Core::Phase::kInventory,
         .restoreMode = Core::RestoreMode::kInstant,
         .requirement = {},

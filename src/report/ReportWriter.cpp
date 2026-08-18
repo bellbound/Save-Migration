@@ -35,6 +35,28 @@ std::string FormatUnixMs(int64_t unixMs) {
     return std::string(buffer);
 }
 
+/// Past this many entries of one kind, the reader is not learning anything new
+/// from the next one. Six identical sentences is where a list stops reading as
+/// detail and starts reading as noise.
+constexpr size_t kAggregateThreshold = 5;
+/// How many of an aggregated group are still shown by name.
+constexpr size_t kAggregateExamples = 3;
+/// Plugin names printed in the LOAD ORDER section before it stops listing. The
+/// full list is always in the JSON twin.
+constexpr size_t kMaxPluginsListed = 25;
+
+void EmitPluginList(std::ostringstream& out, const std::vector<std::string>& plugins,
+                    std::string_view marker) {
+    const auto shown = std::min(plugins.size(), kMaxPluginsListed);
+    for (size_t i = 0; i < shown; ++i) {
+        out << "  " << marker << " " << plugins[i] << "\n";
+    }
+    if (plugins.size() > shown) {
+        out << "  ... and " << (plugins.size() - shown)
+            << " more (the full list is in the .json report)\n";
+    }
+}
+
 std::string SubjectLabel(const SubjectRef& subject) {
     if (subject.displayName.empty()) {
         return subject.formKey.empty() ? std::string(ToString(subject.kind)) : subject.formKey;
@@ -72,16 +94,22 @@ std::string ReportWriter::RenderText(const MigrationReport& report) {
         if (!report.missingPlugins.empty()) {
             out << "Missing (" << report.missingPlugins.size()
                 << ") - keys from these were pre-failed without any lookup:\n";
-            for (const auto& plugin : report.missingPlugins) {
-                out << "  - " << plugin << "\n";
-            }
+            EmitPluginList(out, report.missingPlugins, "-");
         }
         if (!report.addedPlugins.empty()) {
             out << "New since the snapshot (" << report.addedPlugins.size() << "):\n";
-            for (const auto& plugin : report.addedPlugins) {
-                out << "  + " << plugin << "\n";
-            }
+            EmitPluginList(out, report.addedPlugins, "+");
         }
+    }
+
+    // ── Switched off in the INI ───────────────────────────────────────────
+    if (!report.iniDisabledCategories.empty()) {
+        out << "\n" << kThinRule << "\nDISABLED IN THE INI (" << report.iniDisabledCategories.size()
+            << ")\n" << kThinRule << "\n";
+        for (const auto& line : report.iniDisabledCategories) {
+            out << "  " << line << "\n";
+        }
+        out << "Nothing was attempted for these, so nothing about them is a defect.\n";
     }
 
     // ── Category summary ──────────────────────────────────────────────────
@@ -143,7 +171,23 @@ std::string ReportWriter::RenderText(const MigrationReport& report) {
         }
         out << "\n" << kThinRule << "\n" << heading << " (" << matching.size() << ")\n" << kThinRule
             << "\n";
+
+        // Grouped by category and reason, in first-appearance order. Thirty-two
+        // lines of "perk '' could not be resolved" are one finding, and printing
+        // them individually hides the other findings rather than adding to them.
+        // Every entry is still in the JSON twin, one per item, ungrouped.
+        std::vector<std::pair<std::string, std::vector<const ReportEntry*>>> groups;
         for (const auto* entry : matching) {
+            const auto key = std::format("{}|{}", entry->categoryId, ToString(entry->reason));
+            const auto it = std::ranges::find_if(groups, [&](const auto& g) { return g.first == key; });
+            if (it == groups.end()) {
+                groups.emplace_back(key, std::vector<const ReportEntry*>{entry});
+            } else {
+                it->second.push_back(entry);
+            }
+        }
+
+        const auto emitOne = [&](const ReportEntry* entry, bool withHint) {
             out << "[" << entry->categoryId << "]";
             if (entry->reason != ReasonCode::kNone) {
                 out << " <" << ToString(entry->reason) << ">";
@@ -159,7 +203,39 @@ std::string ReportWriter::RenderText(const MigrationReport& report) {
             if (entry->subject.kind != SubjectKind::kSystem) {
                 out << "    subject: " << SubjectLabel(entry->subject) << "\n";
             }
-            if (const auto hint = HintFor(entry->reason); !hint.empty()) {
+            if (withHint) {
+                if (const auto hint = HintFor(entry->reason); !hint.empty()) {
+                    out << "    fix    : " << hint << "\n";
+                }
+            }
+        };
+
+        for (const auto& [key, entries] : groups) {
+            if (entries.size() <= kAggregateThreshold) {
+                for (const auto* entry : entries) {
+                    emitOne(entry, true);
+                }
+                continue;
+            }
+
+            const auto* first = entries.front();
+            out << "[" << first->categoryId << "]";
+            if (first->reason != ReasonCode::kNone) {
+                out << " <" << ToString(first->reason) << ">";
+            }
+            out << " " << entries.size() << " of these:\n";
+            for (size_t i = 0; i < kAggregateExamples; ++i) {
+                const auto* entry = entries[i];
+                out << "    - " << Util::ConvertSkyrimTextToUTF8(entry->message);
+                if (entry->subject.kind == SubjectKind::kActor) {
+                    out << "  [" << SubjectLabel(entry->subject) << "]";
+                }
+                out << "\n";
+            }
+            out << "    ... and " << (entries.size() - kAggregateExamples)
+                << " more of the same kind (all of them are in the .json report)\n";
+            // Once, not per item: the remediation is a property of the reason code.
+            if (const auto hint = HintFor(first->reason); !hint.empty()) {
                 out << "    fix    : " << hint << "\n";
             }
         }
@@ -240,6 +316,7 @@ nlohmann::json ReportWriter::RenderJson(const MigrationReport& report) {
         {"playerLevel", report.playerLevel},
         {"loadOrder",
          {{"missing", report.missingPlugins}, {"added", report.addedPlugins}}},
+        {"iniDisabledCategories", report.iniDisabledCategories},
         {"categories", std::move(categories)},
         {"subjects", std::move(subjects)},
         {"entries", std::move(entries)},

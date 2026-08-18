@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <functional>
 #include <mutex>
 #include <optional>
@@ -36,6 +37,20 @@ public:
     static PapyrusInterface* GetSingleton();
 
     RE::BSScript::Internal::VirtualMachine* GetVM();
+
+    /// How many calls this plugin has handed to the VM and had accepted, since
+    /// the process started. Monotonic, thread-safe, never reset.
+    ///
+    /// Sampled either side of a step, it answers "did that step touch Papyrus?"
+    /// without every category having to declare it - and a declaration is exactly
+    /// what would go stale, since whether a category calls the VM depends on which
+    /// mods are installed and on what the snapshot happens to contain. The import
+    /// uses it to decide which steps have earned settle time: a step that put
+    /// nothing into the VM has nothing to wait for.
+    ///
+    /// A dispatch is not a completion. This counts what the VM took, not what it
+    /// finished, which is the whole reason waiting afterwards is necessary.
+    [[nodiscard]] static std::uint64_t DispatchCount();
 
     /// True when `scriptName` declares a global function called `functionName`
     /// that can accept `argCount` arguments.

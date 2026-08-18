@@ -1,6 +1,7 @@
 #include "papyrus/SaveMigrationMcmApi.h"
 
 #include <atomic>
+#include <chrono>
 #include <format>
 #include <mutex>
 #include <string>
@@ -76,6 +77,31 @@ std::atomic<McmExportStatus::State> g_exportState{McmExportStatus::State::kIdle}
 std::mutex g_exportResultMutex;
 std::string g_exportResult;
 
+/// When `Record` last published a sentence, on the monotonic clock.
+///
+/// The result used to be wiped on every menu open, so that an hour-old "33
+/// categories written" could not be misread as having just happened. That threw
+/// away the answer to the question the player actually asks - "did my export
+/// work?" - because the way to look is to close the menu and open it again.
+/// Keeping the sentence and stamping it with its age answers both: the line
+/// stays, and it says how old it is.
+std::chrono::steady_clock::time_point g_exportResultAt{};
+
+/// "just now" / "4 minutes ago" / "2 hours ago" for a recorded result.
+std::string AgeText(std::chrono::steady_clock::time_point at) {
+    using namespace std::chrono;
+    const auto secs = duration_cast<seconds>(steady_clock::now() - at).count();
+    if (secs < 60) {
+        return "just now";
+    }
+    if (secs < 3600) {
+        const auto mins = secs / 60;
+        return std::format("{} minute{} ago", mins, mins == 1 ? "" : "s");
+    }
+    const auto hours = secs / 3600;
+    return std::format("{} hour{} ago", hours, hours == 1 ? "" : "s");
+}
+
 /// One-shot arming for the deferred import.
 ///
 /// Separate from `sSelectedSnapshot`, and transient rather than in the INI,
@@ -93,28 +119,77 @@ std::atomic<bool> g_importArmed{false};
 /// a DLL probe while another mod's is a plugin probe, and a token that stops
 /// resolving is a visible `false` in one place instead of a silent one spread
 /// across a dozen option handlers.
+/// Compared case-insensitively, and that is not tidiness.
+///
+/// The token arrives as a `BSFixedString`, and the game's string pool is
+/// case-insensitive: interning "skyrimnet" hands back whatever casing the pool
+/// saw first. SkyrimNet's own scripts put "SkyrimNet" in there long before this
+/// menu asks, so a case-sensitive `==` matched nothing and quietly greyed out
+/// both SkyrimNet export options - with `ModPresent('SkyrimNet') - unknown
+/// token` in the log as the only trace.
 bool ResolveModToken(std::string_view token) {
     const auto& probe = ModProbe::Get();
-    if (token == "skyrimnet") {
+    if (Util::IEquals(token, "skyrimnet")) {
         // Either signal. The database side-car is what the export options are
         // about and that is the DLL's; the plugin is what the accompany category
         // needs. Present enough to be worth offering if either is there.
         return probe.HasDll(Known::kSkyrimNetDll) || probe.HasPlugin(Known::kSkyrimNetPlugin);
     }
-    if (token == "fertility") {
+    if (Util::IEquals(token, "fertility")) {
         return probe.HasPlugin(Known::kFertilityPlugin);
     }
-    if (token == "vreditor") {
+    if (Util::IEquals(token, "vreditor")) {
         return probe.HasDll(Known::kVrEditorDll);
     }
-    if (token == "tng") {
+    if (Util::IEquals(token, "tng")) {
         return probe.HasPlugin(Known::kTngPlugin) || probe.HasDll(Known::kTngDll);
     }
-    if (token == "obody") {
+    if (Util::IEquals(token, "obody")) {
         return probe.HasPlugin(Known::kObodyPlugin) || probe.HasDll(Known::kObodyDll);
     }
     spdlog::warn("SaveMigrationMcmApi: ModPresent('{}') - unknown token, answering false", token);
     return false;
+}
+
+/// Dropdown labels for the rows `ListSnapshots` last returned.
+///
+/// Filled by `ListSnapshots` and handed straight back by `ListSnapshotLabels`,
+/// so the two are the same list in the same order by construction. Not a second
+/// scan: `ListAll` stats every file under every snapshot, and doing that twice
+/// per menu open to write the same words twice would be the most expensive thing
+/// the menu does.
+///
+/// Touched only from the VM thread, which is the only place either native runs.
+std::vector<RE::BSFixedString> g_lastLabels;
+
+/// What one row reads as in the dropdown.
+///
+/// Built here rather than in the menu because the menu can no longer split a
+/// packed row into fields - see the comment on `RowField` in SaveMigration_MCM.psc
+/// - and because a label assembled next to the fields it names cannot drift from
+/// them.
+std::string SnapshotLabel(const Store::SnapshotSummary& s) {
+    if (!s.readable) {
+        // Deliberately still listed rather than hidden. A snapshot whose manifest
+        // will not parse is something to notice, not something to be quietly absent.
+        return std::format("(unreadable) {}", Util::PathToUtf8String(s.dir.filename()));
+    }
+
+    std::string label = std::format("{} - level {}, day {:.1f}",
+                                    s.characterName.empty() ? "Unnamed" : s.characterName,
+                                    s.playerLevel, s.gameTimeDays);
+    if (s.automatic) {
+        // Worth saying on the row itself, because these are the only ones ever
+        // deleted on their own to honour "keep the newest N".
+        label = "(auto) " + label;
+    }
+    if (!s.fromLibrary) {
+        // Also worth saying on the row. A game-folder snapshot is only visible to
+        // this modlist, which is the exact problem the shared library exists to
+        // solve, so it should never be a surprise which kind is selected.
+        label += " (game folder)";
+    }
+    return Field(label);
 }
 
 std::vector<RE::BSFixedString> ListSnapshots(RE::StaticFunctionTag*) {
@@ -133,7 +208,11 @@ std::vector<RE::BSFixedString> ListSnapshots(RE::StaticFunctionTag*) {
 
     std::vector<RE::BSFixedString> rows;
     rows.reserve(summaries.size());
+    g_lastLabels.clear();
+    g_lastLabels.reserve(summaries.size());
     for (const auto& s : summaries) {
+        g_lastLabels.emplace_back(SnapshotLabel(s));
+
         // Megabytes, not bytes. A Papyrus int is 32-bit signed, and
         // `iMaxSideCarMb` defaults to 2048 - so a snapshot carrying a full-size
         // SkyrimNet side-car can sit right on the overflow boundary. Rounded up,
@@ -169,6 +248,20 @@ std::vector<RE::BSFixedString> ListSnapshots(RE::StaticFunctionTag*) {
     }
     spdlog::info("SaveMigrationMcmApi: ListSnapshots returned {} row(s)", rows.size());
     return rows;
+}
+
+/// The labels for the rows of the last `ListSnapshots`, in the same order.
+///
+/// A separate native rather than a column of the row, because the dropdown needs
+/// an array of exactly the labels and the menu has no way to build one: every
+/// array-returning SKSE native answers None on this runtime, `CreateStringArray`
+/// included. The plugin's own array returns do arrive, so the list is handed over
+/// whole.
+std::vector<RE::BSFixedString> ListSnapshotLabels(RE::StaticFunctionTag*) {
+    if (g_lastLabels.empty()) {
+        spdlog::warn("SaveMigrationMcmApi: ListSnapshotLabels before any ListSnapshots");
+    }
+    return g_lastLabels;
 }
 
 /// Extra prose for a category that needs it and is not a Mod Support bundle.
@@ -462,6 +555,61 @@ RE::BSFixedString StatusLine(RE::StaticFunctionTag*) {
     return RE::BSFixedString(StatusText());
 }
 
+/// One separated field of `text`, counted from zero. Past the end reads as "".
+///
+/// This is here because the menu cannot do it. Every packed row this file hands
+/// over used to be taken apart in Papyrus with `StringUtil.Find`/`Substring`, and
+/// on this runtime those work only while the start index is zero: field 0 of every
+/// row came back correct and *every* later field came back empty. It is the same
+/// fault as `StringUtil.Split` and `Utility.CreateStringArray` answering None -
+/// SKSE VR's string helpers are not usable past the trivial case - and it is
+/// invisible, because an empty field is a legal field.
+///
+/// What it cost, measured rather than guessed: the category page read blank
+/// display names, blank groups (so all forty-five rows fell to "Uncategorised"),
+/// an availability flag that could never equal "1" (so no export switch was ever
+/// drawn), and a blank INI key - which is why "turn everything on" wrote
+/// `[General] = 1` forty-five times into the config instead of the forty-five
+/// switches it names.
+///
+/// So the split happens here. The menu keeps its `RowField` shape and calls this
+/// for every field; that is one VM round-trip per cell, which for the ~460 cells
+/// of a page reset is far below the cost of the directory scan that produced the
+/// rows in the first place.
+RE::BSFixedString SplitField(RE::StaticFunctionTag*, RE::BSFixedString text,
+                             RE::BSFixedString separator, std::int32_t index) {
+    const std::string_view source(text.c_str() ? text.c_str() : "");
+    const std::string_view delim(separator.c_str() ? separator.c_str() : "");
+    if (index < 0 || delim.empty()) {
+        return RE::BSFixedString("");
+    }
+
+    size_t start = 0;
+    for (std::int32_t skipped = 0; skipped < index; ++skipped) {
+        const auto at = source.find(delim, start);
+        if (at == std::string_view::npos) {
+            return RE::BSFixedString("");
+        }
+        start = at + delim.size();
+    }
+
+    const auto stop = source.find(delim, start);
+    const auto field = stop == std::string_view::npos ? source.substr(start)
+                                                      : source.substr(start, stop - start);
+    return RE::BSFixedString(std::string(field).c_str());
+}
+
+/// Write a line into SaveMigration.log on the menu's behalf.
+///
+/// Papyrus has `Debug.Trace`, but its log is the one place this bug could not be
+/// seen: the fault above was found in *this* log, from a `ConfigStorage` line
+/// showing an empty key, because the Papyrus log for the session in question was
+/// never written. A menu that can put a sentence next to the plugin's own account
+/// of the same moment is worth one native.
+void LogLine(RE::StaticFunctionTag*, RE::BSFixedString text) {
+    spdlog::info("SaveMigration_MCM: {}", text.c_str() ? text.c_str() : "");
+}
+
 }  // namespace
 
 // ── McmExportStatus ───────────────────────────────────────────────────────
@@ -487,6 +635,7 @@ void McmExportStatus::Record(const Core::SnapshotOrchestrator::CompletionInfo& i
     {
         std::lock_guard lock(g_exportResultMutex);
         g_exportResult = std::move(text);
+        g_exportResultAt = std::chrono::steady_clock::now();
     }
     // Stored after the text, so a menu that polls the state and then reads the
     // result never sees "succeeded" beside the previous run's sentence.
@@ -507,7 +656,10 @@ McmExportStatus::State McmExportStatus::Get() { return g_exportState.load(); }
 
 std::string McmExportStatus::Result() {
     std::lock_guard lock(g_exportResultMutex);
-    return g_exportResult;
+    if (g_exportResult.empty() || g_exportState.load() == State::kRunning) {
+        return g_exportResult;
+    }
+    return std::format("{} - {}", g_exportResult, AgeText(g_exportResultAt));
 }
 
 // ── Registration ──────────────────────────────────────────────────────────
@@ -518,6 +670,7 @@ bool SaveMigrationMcmApi::Bind(RE::BSScript::IVirtualMachine* vm) {
     }
     const std::string script(kScriptName);
     vm->RegisterFunction("ListSnapshots", script, ListSnapshots);
+    vm->RegisterFunction("ListSnapshotLabels", script, ListSnapshotLabels);
     vm->RegisterFunction("ListCategories", script, ListCategories);
     vm->RegisterFunction("ListSnapshotContents", script, ListSnapshotContents);
     vm->RegisterFunction("ExportNow", script, ExportNow);
@@ -530,7 +683,9 @@ bool SaveMigrationMcmApi::Bind(RE::BSScript::IVirtualMachine* vm) {
     vm->RegisterFunction("ClearAppliedFlag", script, ClearAppliedFlag);
     vm->RegisterFunction("ModPresent", script, ModPresent);
     vm->RegisterFunction("StatusLine", script, StatusLine);
-    spdlog::info("SaveMigrationMcmApi: registered 12 natives on '{}'", script);
+    vm->RegisterFunction("SplitField", script, SplitField);
+    vm->RegisterFunction("LogLine", script, LogLine);
+    spdlog::info("SaveMigrationMcmApi: registered 16 natives on '{}'", script);
     return true;
 }
 

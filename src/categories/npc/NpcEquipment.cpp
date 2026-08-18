@@ -1,5 +1,6 @@
 #include "categories/npc/NpcEquipment.h"
 
+#include <algorithm>
 #include <format>
 
 #include "categories/EquipmentCommon.h"
@@ -20,7 +21,9 @@ const Core::CategoryDescriptor& NpcEquipment::Describe() const {
         .id = kId,
         .displayName = "NPC equipment",
         .phase = Core::Phase::kFollowers,
-        .restoreMode = Core::RestoreMode::kDeferred,
+        // Hybrid, not deferred: every recorded item is attempted and read back at
+        // import time, and only what fails to confirm goes on the queue.
+        .restoreMode = Core::RestoreMode::kHybrid,
         .requirement = {},
         .schemaVersion = 1,
     };
@@ -64,17 +67,53 @@ void NpcEquipment::ApplyActor(const Model::ActorSubject& subject, Core::ApplyCon
     const Report::SubjectRef subjectRef{Report::SubjectKind::kActor, subject.refKey,
                                         subject.displayName};
 
-    // If the actor happens to be loaded right now, do it immediately rather than
-    // making the user walk back to them.
-    if (Util::ActorEnum::IsReadyForEquip(subject.actor)) {
-        const auto result = EquipmentCommon::Apply(subject.actor, payload["worn"], subjectRef, ctx);
-        ctx.report.Info(std::format("'{}' was already loaded: {} equipped immediately",
-                                    subject.displayName, result.equipped));
+    // ── Try first, ask afterwards ─────────────────────────────────────────
+    // This used to test `IsReadyForEquip` and queue the whole outfit without
+    // attempting anything when the answer was no. That made "an unloaded actor
+    // cannot be equipped" an assumption the run never tested - and it is only an
+    // assumption: `EquipObject` returns void, so nothing here had ever measured
+    // it either way.
+    //
+    // Now the attempt is made unconditionally and `EquipmentCommon` reads each
+    // item back. Whatever confirms is done, for free, however far away the actor
+    // is. Only what does not confirm goes on the queue, which is what turns the
+    // deferred path into a fallback rather than the default.
+    const auto result = EquipmentCommon::Apply(subject.actor, payload["worn"], subjectRef, ctx);
+
+    if (result.unconfirmedKeys.empty()) {
+        // Nothing left to wait for. Silent when there was nothing to do at all,
+        // because a line saying "0 equipped" for every roster actor who happens to
+        // wear nothing recorded is a constant, not a payload.
+        if (result.verified > 0 || result.alreadyWorn > 0) {
+            ctx.report.Info(std::format("'{}': {} item(s) equipped and confirmed worn during the "
+                                        "import{}",
+                                        subject.displayName, result.verified,
+                                        result.alreadyWorn > 0
+                                            ? std::format(", {} already worn", result.alreadyWorn)
+                                            : std::string{}));
+        }
         return;
     }
 
-    // Otherwise queue it. The payload is embedded whole, so the queue survives the
-    // snapshot directory being deleted or the mod folder moving.
+    // Queue the remainder only. The payload is rebuilt from the unconfirmed keys
+    // rather than embedded whole, so the replay does not walk 32 slots to discover
+    // that 30 of them landed an hour ago - and so the queue item shrinks as the
+    // outfit lands piece by piece across several attempts.
+    auto remainder = nlohmann::json::array();
+    for (const auto& entry : payload["worn"]) {
+        const auto key = entry.value("form", std::string{});
+        if (std::find(result.unconfirmedKeys.begin(), result.unconfirmedKeys.end(), key) !=
+            result.unconfirmedKeys.end()) {
+            remainder.push_back(entry);
+        }
+    }
+
+    nlohmann::json queued = nlohmann::json::object();
+    queued["worn"] = std::move(remainder);
+    if (const auto cell = payload.find("cell"); cell != payload.end()) {
+        queued["cell"] = *cell;
+    }
+
     Defer::PendingItem item;
     item.categoryId = std::string(kId);
     item.subjectFormKey = subject.refKey;
@@ -82,19 +121,23 @@ void NpcEquipment::ApplyActor(const Model::ActorSubject& subject, Core::ApplyCon
     item.trigger = Defer::TriggerBits(Defer::Trigger::kActorLoaded) |
                    Defer::TriggerBits(Defer::Trigger::kCellFullyLoaded);
     item.maxAttempts = static_cast<uint32_t>(Config::MigrationConfig::DeferMaxAttempts());
-    item.payload = Util::SafeDump(payload);
+    item.payload = Util::SafeDump(queued);
 
     if (ctx.pending.Enqueue(std::move(item))) {
-        ctx.report.Deferred(subjectRef, std::format("{}/equipment", subject.refKey),
-                            std::format("'{}' is not loaded; their gear will be equipped when you "
-                                        "next see them",
-                                        subject.displayName));
+        // No `Deferred` line here, on purpose. The import's settle pass runs after
+        // the follower regroup has brought these actors to the player, and it
+        // drains most of this queue before the run ends - so a line claiming the
+        // gear is waiting would be written before we know whether it is. The
+        // orchestrator reports whatever genuinely survives the settle.
+        spdlog::debug("NpcEquipment: {} of {} item(s) for '{}' did not confirm; queued",
+                      result.unconfirmed, result.unconfirmed + result.verified + result.alreadyWorn,
+                      subject.displayName);
     } else {
         ctx.report.Failed(subjectRef, std::format("{}/equipment", subject.refKey),
                           Report::ReasonCode::kDeferredExhausted,
-                          std::format("could not queue equipment for '{}' (queue full or payload "
-                                      "oversized)",
-                                      subject.displayName));
+                          std::format("could not queue the remaining {} item(s) of equipment for "
+                                      "'{}' (queue full or payload oversized)",
+                                      result.unconfirmed, subject.displayName));
     }
 }
 
@@ -114,8 +157,22 @@ bool NpcEquipment::ApplyDeferred(const Model::ActorSubject& subject, Core::Apply
 
     // A partial result still retires: the failures are individually reported, and
     // retrying would re-report them every time the actor loads.
-    ctx.report.Info(std::format("deferred equipment for '{}': {} equipped, {} failed",
-                                subject.displayName, result.equipped, result.failed));
+    ctx.report.Info(std::format("deferred equipment for '{}': {} confirmed worn, {} did not "
+                                "confirm, {} could not be attempted",
+                                subject.displayName, result.verified, result.unconfirmed,
+                                result.failed));
+
+    // The actor was loaded, the engine took the equip, and the item still does not
+    // read back as worn. Retrying is what the attempt counter is for and it has
+    // been spent, so this is where it stops being "not yet" and becomes an outcome.
+    for (const auto& key : result.unconfirmedKeys) {
+        ctx.report.Failed(subjectRef, std::format("{}/equip/{}", subject.refKey, key),
+                          Report::ReasonCode::kValidationMismatch,
+                          std::format("'{}' was loaded and the equip was accepted, but the item "
+                                      "did not read back as worn",
+                                      subject.displayName),
+                          key);
+    }
     return true;
 }
 
